@@ -37,6 +37,10 @@ EARLY = 3.0           # во сколько раз строже порог, по
 MIN_DUR = 8.0         # реакция короче этого = чат «чуть посмеялся»
 MIN_USERS = 6         # реагировало меньше зрителей = это не чат, а пара человек
 MIN_UNIQ = 0.4        # доля разных зрителей среди сообщений; ниже = спам одних и тех же
+# После клипа столько секунд с этого канала берётся только момент заметно сильнее прошлого. В горячие минуты чат
+# взрывается раз за разом, и без паузы один стрим давал по пять клипов за восемь минут (проверка на Twitch).
+PAUSE = {1: 600, 2: 420, 3: 300, 4: 150, 5: 0}
+STRONGER = 1.3        # во сколько раз сильнее прошлого клипа должна быть реакция, чтобы не ждать конца паузы
 
 
 @dataclass
@@ -74,6 +78,7 @@ class Detector:
         self.minute_peaks: deque[tuple[int, float]] = deque(maxlen=RARE_HISTORY)
         self._minute: tuple[int, float] | None = None
         self.skipped: Counter = Counter()     # сколько всплесков отсеяно и почему (для журнала и «библии»)
+        self.last_clip: tuple[float, float] | None = None     # последний клип: (когда кончилась реакция, её сила)
         self.last_skip = ""
         # для интерфейса
         self.rate = 0.0
@@ -84,6 +89,7 @@ class Detector:
         zr, mr, zt = SENS.get(int(s), SENS[3])
         self.z_react, self.min_react, self.z_total = zr * mult, max(3, round(mr * mult)), zt * mult
         self.rare = RARE.get(int(s), RARE[3])
+        self.pause = PAUSE.get(int(s), PAUSE[3])
 
     def set_words(self, pos: set[str], neg: set[str]) -> None:
         self.words_pos, self.words_neg = set(pos), set(neg)
@@ -101,6 +107,7 @@ class Detector:
         self.hype = None
         self.started = now
         self.block_until = 0.0
+        self.last_clip = None
 
     # --- ввод ---------------------------------------------------------------
     def add_message(self, t: float, user: str, text: str) -> None:
@@ -168,9 +175,12 @@ class Detector:
         if bar is None:
             if h["peak_z"] < self.z_react * EARLY:
                 return "для первых минут наблюдения реакция слабовата"
-            return ""
-        if h["peak_rate"] <= bar:
+        elif h["peak_rate"] <= bar:
             return f"у этого чата бывает сильнее ({h['peak_rate']:.1f} реакции/с при планке {bar:.1f})"
+        last = self.last_clip
+        if last and h["onset"] - last[0] < self.pause and h["peak_rate"] < STRONGER * last[1]:
+            return (f"клип с этого канала только что был, а этот момент не сильнее "
+                    f"({h['peak_rate']:.1f} реакции/с против {last[1]:.1f})")
         return ""
 
     def _skip(self, why: str) -> None:
@@ -267,6 +277,7 @@ class Detector:
             if len(users) < MIN_USERS or len(users) / n_in < MIN_UNIQ:
                 return self._skip("реагировало слишком мало зрителей")
         self.block_until = s + REFRACTORY
+        self.last_clip = (end, h["peak_rate"])
         spikes = []
         for tok, n in tok_cnt.most_common(40):
             if n < max(4, 0.04 * n_in):
