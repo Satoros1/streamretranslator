@@ -76,6 +76,7 @@ DEFAULTS: dict = {
     "tg_bot_token": "",
     "tg_phone": "",
     "tg_channel": "",           # @username, ссылка t.me/... или числовой id
+    "tg_channel_title": "",     # название канала для показа в окне (если он выбран из списка «Мои каналы»)
     "tg_alerts_chat": "",       # куда слать служебные уведомления; пусто = «Избранное»/канал
     "tg_alerts": True,
     "delete_after_upload": False,

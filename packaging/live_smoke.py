@@ -131,10 +131,11 @@ def main() -> int:
             subprocess.run(["ffmpeg", "-hide_banner", "-loglevel", "error", "-y", "-ss", "20", "-i", p, "-frames:v", "1",
                             "-vf", "scale=540:-2", os.path.join(out, "live_vertical_%d.jpg" % i)])
     # Хронология монтажа: успевает ли он за моментами. Печатается в конце, чтобы попасть в хвост лога.
-    marks = ("пойман момент", "клип готов", "пропущен", "не удался", "не получился", "Запущено")
+    marks = ("пойман момент", "клип готов", "пропущен", "не удался", "не получился", "Запущено", "перезапускаю",
+             "стрим закончился")
     caught = [ln for ln in text.splitlines() if "INFO supervisor" in ln and any(m in ln for m in marks)]
     print("TIMELINE (%d lines):" % len(caught))
-    for ln in caught[:70]:
+    for ln in caught[:150]:
         print("  " + ln[11:19] + " " + ln.split("supervisor: ", 1)[-1][:110])
     left = re.search(r"UNFINISHED EDITS: (\d+)", text)
     print("moments caught: %d, clips made: %d, dropped as weakest: %d, left unedited: %s" % (

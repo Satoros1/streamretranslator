@@ -107,6 +107,33 @@ class UploadQueue:
             db.execute("DELETE FROM uploads WHERE status='sent' AND sent_at<?", (time.time() - 30 * 86400,))
 
 
+TG_KEYS = ("tg_enabled", "tg_mode", "tg_api_id", "tg_api_hash", "tg_bot_token", "tg_phone", "tg_channel",
+           "tg_alerts", "tg_alerts_chat")
+
+
+def pick_channel(text: str, items: list[tuple[str, object]], index: int = -1) -> tuple[str, str]:
+    """Что записать в настройки по тому, что стоит в поле канала: (канал, его название для показа).
+
+    Канал, выбранный из списка «Мои каналы», запоминается по номеру: название могут поменять, а приватный
+    канал по названию не найти. Текст, набранный руками (@имя или ссылка), берётся как есть.
+    """
+    text = text.strip()
+    if 0 <= index < len(items) and items[index][0] == text and items[index][1]:
+        return str(items[index][1]), text
+    same = [str(cid) for title, cid in items if cid and title.strip().lower() == text.lower()]
+    if text and len(set(same)) == 1:                    # название набрано руками, а выбрать из списка забыли
+        return same[0], next(t for t, c in items if str(c) == same[0])
+    return text, ""
+
+
+def summarize_test(res: list[tuple[str, str]], alerts_on: bool = True) -> tuple[str, bool]:
+    """Текст для человека по итогам проверочного сообщения: (текст, есть ли ошибки)."""
+    lines = [f"{where}: " + (f"не получилось ❌ {why}" if why else "отправлено ✅") for where, why in res]
+    if not alerts_on:
+        lines.append("Уведомления выключены галочкой выше, поэтому в чат для уведомлений ничего не отправлялось.")
+    return "\n".join(lines), any(why for _where, why in res)
+
+
 class Telegram:
     """Живёт в своём потоке. Всё наружу потокобезопасно."""
 
@@ -215,6 +242,57 @@ class Telegram:
                     out.append((str(d.id), d.name or str(d.id)))
             return out
         return self.call(go, 90)
+
+    def send_test(self) -> list[tuple[str, str]]:
+        """Проверочное сообщение туда же, куда пойдут клипы и уведомления (кнопка в настройках).
+        Возвращает [(куда, ошибка)]: пустая ошибка значит, что сообщение дошло."""
+        return self.call(self._send_test, 60)
+
+    async def _send_test(self) -> list[tuple[str, str]]:
+        client, cfg = self._client, self._cfg
+        if client is None:
+            raise RuntimeError("Telegram ещё не подключён")
+        bot = cfg.get("tg_mode") == "bot"
+        out = []
+        # 1) канал, куда уходят клипы: человеку важно увидеть именно его
+        if self._target is None:
+            why = self.status_text if self.status == "no_channel" else "канал не выбран"
+            out.append(("Канал для клипов", why))
+        else:
+            out.append(("Канал для клипов", await self._try_send(
+                client, self._target, "🛠 StreamClipper\nПроверка связи: сюда будут приходить клипы ✅\n"
+                                      "Это сообщение можно удалить.")))
+        # 2) чат для служебных уведомлений
+        if cfg.get("tg_alerts", True):
+            dest = str(cfg.get("tg_alerts_chat", "")).strip()
+            where = f"Уведомления ({dest})" if dest else "Уведомления («Избранное»)"
+            if not dest and bot:
+                out.append(("Уведомления", "боту нужно указать чат для уведомлений в поле выше"))
+            else:
+                try:
+                    target = await self._resolve(client, dest, bot) if dest else "me"
+                except Exception as e:
+                    out.append((where, f"чат не найден: {str(e)[:100]}"))
+                else:
+                    out.append((where, await self._try_send(
+                        client, target, "🛠 StreamClipper\nПроверка связи: сюда будут приходить уведомления ✅")))
+        return out
+
+    @staticmethod
+    async def _try_send(client, target, text: str) -> str:
+        """Отправляет сообщение и возвращает понятную причину, если не вышло (пустая строка = дошло)."""
+        try:
+            await client.send_message(target, text)
+            return ""
+        except Exception as e:
+            kind = type(e).__name__
+            if kind in ("ChatWriteForbiddenError", "ChatAdminRequiredError", "UserBannedInChannelError"):
+                return "нет прав писать сюда: сделай аккаунт или бота админом с правом публикации"
+            if kind == "ChannelPrivateError":
+                return "нет доступа: аккаунт или бот не состоит в этом канале"
+            if kind == "FloodWaitError":
+                return f"Telegram просит подождать {getattr(e, 'seconds', '?')} с, попробуй позже"
+            return str(e)[:120] or kind
 
     def logout(self) -> None:
         async def go():

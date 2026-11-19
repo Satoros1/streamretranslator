@@ -17,6 +17,7 @@ from PySide6.QtWidgets import (QApplication, QCheckBox, QComboBox, QFileDialog, 
 
 from . import APP_NAME, __version__, config, system, util
 from .supervisor import Supervisor
+from .uploader import TG_KEYS, pick_channel, summarize_test
 from .ui import theme as T
 
 
@@ -571,8 +572,8 @@ class MainWindow(QWidget):
         self.tg_channel = QComboBox()
         self.tg_channel.setEditable(True)
         self.tg_channel.lineEdit().setPlaceholderText("@имя_канала или ссылка t.me/…")
-        if cfg["tg_channel"]:
-            self.tg_channel.addItem(str(cfg["tg_channel"]), str(cfg["tg_channel"]))
+        if cfg["tg_channel"]:                           # показываем название канала, а не его номер
+            self.tg_channel.addItem(str(cfg.get("tg_channel_title") or cfg["tg_channel"]), str(cfg["tg_channel"]))
         r.addWidget(self.tg_channel, 1)
         self.chan_btn = button("Мои каналы", None, "refresh")
         self.chan_btn.setToolTip("Показать каналы, где ты админ, чтобы выбрать из списка")
@@ -594,9 +595,10 @@ class MainWindow(QWidget):
         save = button("Сохранить и подключиться", "primary")
         save.clicked.connect(self.tg_save)
         r.addWidget(save)
-        test = button("Отправить проверочное сообщение")
-        test.clicked.connect(self.tg_test)
-        r.addWidget(test)
+        self.test_btn = button("Отправить проверочное сообщение")
+        self.test_btn.setToolTip("Отправляет сообщение в канал для клипов и в чат для уведомлений и показывает, куда оно дошло")
+        self.test_btn.clicked.connect(self.tg_test)
+        r.addWidget(self.test_btn)
         r.addStretch(1)
         lay.addLayout(r)
         self.tg_msg = label("", "muted", wrap=True)
@@ -617,14 +619,13 @@ class MainWindow(QWidget):
 
     def _tg_collect(self) -> dict:
         cfg = dict(self.sup.cfg)
-        chan = self.tg_channel.currentText().strip()
-        idx = self.tg_channel.currentIndex()
-        if idx >= 0 and self.tg_channel.itemText(idx) == chan and self.tg_channel.itemData(idx):
-            chan = str(self.tg_channel.itemData(idx))
+        chan, title = pick_channel(self.tg_channel.currentText(),
+                                   [(self.tg_channel.itemText(i), self.tg_channel.itemData(i))
+                                    for i in range(self.tg_channel.count())], self.tg_channel.currentIndex())
         cfg.update(tg_enabled=self.tg_enabled.isChecked(), tg_mode=self.tg_mode.currentData(),
                    tg_api_id=self.tg_api_id.text().strip(), tg_api_hash=self.tg_api_hash.text().strip(),
                    tg_bot_token=self.tg_bot_token.text().strip(), tg_phone=self.tg_phone.text().strip(),
-                   tg_channel=chan, tg_alerts=self.tg_alerts.isChecked(),
+                   tg_channel=chan, tg_channel_title=title, tg_alerts=self.tg_alerts.isChecked(),
                    tg_alerts_chat=self.tg_alerts_chat.text().strip(), delete_after_upload=self.tg_delete.isChecked())
         return cfg
 
@@ -634,15 +635,24 @@ class MainWindow(QWidget):
 
     def tg_test(self) -> None:
         tg = self.sup.tg
+        shown = self._tg_collect()
+        if any(shown.get(k) != self.sup.cfg.get(k) for k in TG_KEYS):
+            return self.tg_note("На этой странице есть несохранённые изменения. Сначала нажми «Сохранить и "
+                                "подключиться», дождись состояния «подключён» и проверь ещё раз.", True)
         if tg.status not in ("ok", "no_channel"):
             return self.tg_note(f"Telegram пока не подключён ({tg.status_text}). Сначала нажми «Сохранить и "
                                 "подключиться» и дождись состояния «подключён».", True)
-        if not self.sup.cfg.get("tg_alerts", True):
-            return self.tg_note("Уведомления выключены галочкой выше: включи её и сохрани.", True)
-        if self.sup.cfg.get("tg_mode") == "bot" and not str(self.sup.cfg.get("tg_alerts_chat", "")).strip():
-            return self.tg_note("Боту нужно указать, куда слать уведомления: впиши чат в поле выше и сохрани.", True)
-        tg.alert("Проверка связи: всё работает ✅")
-        self.tg_note("Отправил. Сообщение придёт в чат для уведомлений (по умолчанию «Избранное»).")
+        self.test_btn.setEnabled(False)
+        self.tg_note("Отправляю проверочное сообщение…")
+
+        def done(res, err):
+            self.test_btn.setEnabled(True)
+            if err:
+                return self.tg_note(f"Не получилось: {err}", True)
+            text, bad = summarize_test(res, bool(self.sup.cfg.get("tg_alerts", True)))
+            self.tg_note(text, bad)
+
+        self.bridge.run(tg.send_test, done)
 
     def tg_request_code(self) -> None:
         cfg = self._tg_collect()
@@ -698,13 +708,18 @@ class MainWindow(QWidget):
             self.chan_btn.setEnabled(True)
             if err:
                 return self.tg_note(f"Не удалось получить список каналов: {err}. Сначала войди в аккаунт.", True)
-            cur = self.tg_channel.currentText()
+            cur = self.tg_channel.currentText().strip()
+            saved = str(self.sup.cfg.get("tg_channel", ""))
             self.tg_channel.clear()
             for cid, title in res:
                 self.tg_channel.addItem(title, cid)
-            if cur and self.tg_channel.findText(cur) < 0 and not res:
-                self.tg_channel.setEditText(cur)
-            self.tg_note(f"Найдено каналов: {len(res)}. Выбери нужный и нажми «Сохранить и подключиться»." if res
+            # Прежний выбор сохраняем. Если его в списке нет, не выбираем ничего: иначе первым в списке
+            # молча оказался бы чужой канал, и клипы ушли бы не туда.
+            keep = next((i for i, (cid, title) in enumerate(res) if cid == saved or title == cur), -1)
+            self.tg_channel.setCurrentIndex(keep)
+            if keep < 0:
+                self.tg_channel.setEditText("" if res else cur)
+            self.tg_note(f"Найдено каналов: {len(res)}. Выбери нужный в списке и нажми «Сохранить и подключиться»." if res
                          else "Не нашёл каналов, где ты админ. Создай канал в Telegram и нажми ещё раз.")
 
         self.bridge.run(self.sup.tg.list_channels, done)
