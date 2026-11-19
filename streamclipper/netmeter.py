@@ -79,11 +79,13 @@ def attach(src, meter: NetMeter, cap_kbps: float = 0.0) -> bool:
         return False
 
     def timed(segment, *args, **kwargs):
-        t0 = time.monotonic()
+        # perf_counter, а не monotonic: у monotonic в Windows шаг около 16 мс, и быстро скачанный кусочек
+        # выходил «скачанным за ноль секунд»
+        t0 = time.perf_counter()
         res = fetch(segment, *args, **kwargs)
         try:
             media = float(getattr(segment, "duration", 0) or 0)
-            took = time.monotonic() - t0
+            took = time.perf_counter() - t0
             if media <= 0 or getattr(segment, "ad", False):
                 return res
             if res is None:
