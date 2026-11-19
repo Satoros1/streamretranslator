@@ -29,7 +29,7 @@ from .learning import Learner, learnable, tokenize
 
 log = logging.getLogger("worker")
 
-GAP = 6.0             # нет данных столько секунд = разрыв (реклама/обрыв), клип через него не режем
+GAP = 10.0            # нет данных столько секунд = разрыв (реклама/обрыв), клип через него не режем
 PRE_ROLL = 45         # сколько секунд до реакции чата отдаём монтажёру на выбор
 POST_ROLL = 8
 MAX_RAW = 170
@@ -62,6 +62,7 @@ class Worker:
         self.last_clip_end = 0.0
         existing = segments.scan(self.buf_dir)
         self.run_no = (existing[-1].run if existing else 0) + 1
+        self.first_run = self.run_no + 1                 # номер самого первого куска записи в этом запуске
         self.chat = ChatClient(channel, self._on_chat, self._on_chat_delete)
         # чат последних минут с цветами ников и смайлами: из него рисуется чат поверх клипа
         self.chatlog: collections.deque = collections.deque()
@@ -138,6 +139,9 @@ class Worker:
         session.set_option("stream-timeout", 120)
         session.set_option("hls-segment-attempts", 5)
         session.set_option("hls-playlist-reload-attempts", 5)
+        # По умолчанию плейлист перечитывается раз в 6 секунд, и видео приходит пачками по 6 секунд.
+        # Перечитываем с шагом в один кусок (обычно 2 с), как плеер Twitch: видео идёт ровно и без лишней задержки.
+        session.set_option("hls-playlist-reload-time", "segment")
         opts = Options()
         tok = (self.cfg.get("twitch_oauth") or "").strip()
         if tok:
@@ -161,6 +165,8 @@ class Worker:
 
     def _start_ffmpeg(self, kind: str = "ts") -> subprocess.Popen:
         self.run_no += 1
+        if self.run_no > self.first_run:
+            log.info("видео снова идёт: запись продолжается новым куском №%d", self.run_no)
         err = tempfile.TemporaryFile()
         ff = subprocess.Popen(recorder_cmd(self.buf_dir, self.run_no, kind), stdin=subprocess.PIPE,
                               stdout=subprocess.DEVNULL, stderr=err, creationflags=util.NO_WINDOW)
@@ -246,6 +252,8 @@ class Worker:
                         self._close_ffmpeg(ff)
                         ff = None
                         self.state = "ad" if time.time() < self.ad_until + 20 else "pause"
+                        log.info("видео не приходит %d с (%s): клипы через этот разрыв не режутся", idle,
+                                 "реклама" if self.state == "ad" else "пауза или обрыв")
                     if idle > 600:
                         break
                     continue
