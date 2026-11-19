@@ -131,17 +131,30 @@ def rank(streams: dict) -> list[tuple[int, int, str, int]]:
     return sorted(out)
 
 
-def lower(ranked: list[tuple[int, int, str, int]], current: str, speed: float) -> tuple[int, int, str, int] | None:
+FLOOR = 720           # ниже такой высоты кадра запись сама себя не снижает (меняется в настройках)
+
+
+def floor_of(cfg: dict) -> int:
+    """Настройка «при медленном интернете не опускать ниже»: высота кадра. 0: опускать сколько нужно."""
+    try:
+        return max(0, int(str(cfg.get("quality_floor", FLOOR)).lower().rstrip("p") or 0))
+    except (TypeError, ValueError):
+        return FLOOR
+
+
+def lower(ranked: list[tuple[int, int, str, int]], current: str, speed: float,
+          floor: int = 0) -> tuple[int, int, str, int] | None:
     """Какое качество взять, когда интернет не успевает за текущим. None: ниже уже некуда.
 
     speed: измеренная скорость скачивания этого стрима, бит/с. Берётся самое высокое качество, которому её
     хватает с запасом. Если скорости плейлист не называет, спускаемся на одну ступень.
+    floor: ниже этой высоты кадра не опускаемся, даже если интернета не хватает и на неё.
     """
     ranked = sorted(ranked)
     if not ranked:
         return None
     cur = next((r for r in ranked if r[2] == current), ranked[-1])      # «best» и незнакомое имя = самое высокое
-    below = [r for r in ranked if r[:2] < cur[:2]]
+    below = [r for r in ranked if r[:2] < cur[:2] and r[0] >= floor]
     if not below:
         return None
     if speed > 0 and all(r[3] for r in below):

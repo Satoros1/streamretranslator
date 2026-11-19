@@ -57,6 +57,20 @@ class Event:
     features: dict = field(default_factory=dict)      # для самообучения
     tokens: list[str] = field(default_factory=list)   # слова, которые «выстрелили» именно в этот момент
     chat: list[tuple[float, str, str]] = field(default_factory=list)
+    edge: float = 1.0     # во сколько раз реакция сильнее планки, с которой у этого канала начинается клип
+
+
+def strength(ev: Event, learned: int | None = None) -> float:
+    """Сила момента одним числом: по ней моменты разных каналов сравниваются в очереди клипов (pacer.py).
+
+    Оценка 0..100 для этого не годится: у сильных моментов она упирается в потолок, и считается она от обычного
+    фона чата, а не от его лучших минут. Здесь основа другая: во сколько раз реакция сильнее планки своего
+    канала. Смех ценится выше прочих реакций (программа делает нарезки смешного), и учитывается вкус владельца:
+    learned это оценка момента, поправленная по его 👍 и 👎.
+    """
+    laugh = float(ev.features.get("laugh", 0.5))
+    taste = 1.0 if learned is None else max(0.5, min(2.0, learned / max(1, ev.score)))
+    return round(max(0.0, ev.edge) * (0.75 + 0.25 * laugh) * taste, 3)
 
 
 class Detector:
@@ -183,6 +197,14 @@ class Detector:
                     f"({h['peak_rate']:.1f} реакции/с против {last[1]:.1f})")
         return ""
 
+    def _edge(self, h: dict) -> float:
+        """Во сколько раз всплеск сильнее планки, с которой начинается клип. Пока планки нет (первые минуты
+        наблюдения, чувствительность 5), меряется от порога срабатывания."""
+        bar = self.rare_bar(h["onset"])
+        if bar:
+            return h["peak_rate"] / bar
+        return h["peak_z"] / (self.z_react * (EARLY if self.rare else 1.0))
+
     def _skip(self, why: str) -> None:
         self.skipped[why.split(" (")[0]] += 1
         self.last_skip = why
@@ -294,4 +316,5 @@ class Detector:
         return Event(onset=onset, peak=h["peak"], end=end, score=max(1, min(100, score)),
                      peak_z=round(h["peak_z"], 1), share=round(h["share"], 2),
                      kind="laugh" if h["laugh"] >= h["hype"] else "hype",
-                     messages=len(inside), top=top, features=feats, tokens=spikes[:10], chat=chat[-400:])
+                     messages=len(inside), top=top, features=feats, tokens=spikes[:10], chat=chat[-400:],
+                     edge=round(self._edge(h), 3))

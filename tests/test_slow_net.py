@@ -5,7 +5,7 @@ from types import SimpleNamespace
 import pytest
 
 from streamclipper import netmeter
-from streamclipper.netmeter import BUSY, HEADROOM, SLOW, NetMeter, attach, lower, rank
+from streamclipper.netmeter import BUSY, FLOOR, HEADROOM, SLOW, NetMeter, attach, floor_of, lower, rank
 from streamclipper.supervisor import OFFLINE_CONFIRM, Supervisor, WorkerHandle
 from streamclipper.worker import CAP_FORGET, Worker, pick_quality
 
@@ -182,6 +182,25 @@ def test_lower_goes_one_step_down_when_bitrates_are_unknown():
     assert lower(LADDER, "1080p60", 0.0)[2] == "720p60"              # скорость измерить не удалось
 
 
+def test_quality_is_never_lowered_below_the_floor():
+    """«720p минимум»: мутный клип не нужен, даже если интернет не тянет."""
+    full = LADDER[:3] + [(720, 30, "720p", 2_300_000)] + LADDER[3:]
+    assert lower(full, "1080p60", 5_000_000, 720)[2] == "720p60"
+    assert lower(full, "1080p60", 3_500_000, 720)[2] == "720p"           # 720p60 не влезает, а 720p ещё да
+    assert lower(full, "1080p60", 500_000, 720)[2] == "720p"             # не влезает ничего: самое лёгкое из разрешённых
+    assert lower(full, "720p60", 500_000, 720)[2] == "720p"
+    assert lower(full, "720p", 500_000, 720) is None                     # ниже нельзя
+    assert lower(full, "720p", 500_000)[2] == "160p"                     # без ограничения было бы так
+    assert lower(LADDER, "720p60", 500_000, 720) is None
+    assert lower(LADDER, "1080p60", 500_000, 1080) is None
+    assert lower([r[:3] + (0,) for r in full], "1080p60", 0.0, 720)[2] == "720p60"
+    assert lower([r[:3] + (0,) for r in full], "720p", 0.0, 720) is None
+    assert FLOOR == 720 and floor_of({}) == 720
+    assert floor_of({"quality_floor": "1080"}) == 1080 and floor_of({"quality_floor": "480p"}) == 480
+    assert floor_of({"quality_floor": "0"}) == 0 and floor_of({"quality_floor": 0}) == 0
+    assert floor_of({"quality_floor": ""}) == 0 and floor_of({"quality_floor": "как угодно"}) == 720
+
+
 def test_pick_quality_respects_the_ceiling_set_by_slow_internet():
     names = ["audio_only", "160p", "360p", "480p", "720p60", "1080p60", "worst", "best"]
     assert pick_quality(names, "best") == "best"
@@ -203,8 +222,52 @@ def test_worker_lowers_quality_and_says_so(home):
     w.emit = lambda **m: sent.append(m)
     w.variants, w.quality = list(LADDER), "1080p60"
     assert w._lower_quality(1.4, 2_500_000) is True
-    assert w.auto_cap == (480, 30) and w._reopen is True
-    assert _events(sent) == [("slow_net", "1080p60", "480p")]
+    assert w.auto_cap == (720, 60) and w._reopen is True      # на 480p скорости хватило бы с запасом, но ниже 720p нельзя
+    assert _events(sent) == [("slow_net", "1080p60", "720p60")]
+
+
+def test_worker_does_not_go_below_720p_and_says_so_rarely(home):
+    w = Worker("ch")
+    sent = []
+    w.emit = lambda **m: sent.append(m)
+    w.variants, w.quality = list(LADDER), "720p60"
+    assert w._lower_quality(1.6, 1_000_000) is False
+    assert w._lower_quality(1.6, 1_000_000) is False     # проверка идёт каждые 5 секунд, а сказать надо один раз
+    assert w.auto_cap is None and w._reopen is False and w.quality == "720p60"
+    assert [(m["kind"], m["old"], m["new"], m["floor"]) for m in sent] == [("slow_net", "720p60", "", 720)]
+
+
+def test_raising_the_floor_brings_an_already_lowered_stream_back_up(home):
+    from streamclipper import config
+    config.save(dict(config.load(), quality_floor="0"))
+    w = Worker("ch")
+    w.auto_cap, w.quality, w.pump_beat = (480, 30), "480p", 1_000_000.0     # запись идёт, качество уже снижено до 480p
+    w._reload()
+    assert w.auto_cap == (480, 30) and w._reopen is False                   # настройки не менялись: ничего не трогаем
+    config.save(dict(config.load(), quality_floor="720"))
+    w._reload()
+    assert w.auto_cap is None and w._reopen is True                         # теперь 480p нельзя: стрим открывается заново
+    w.auto_cap, w._reopen, w.pump_beat = (480, 30), False, 0.0              # эфира сейчас нет: открывать нечего
+    w._reload()
+    assert w.auto_cap is None and w._reopen is False
+    w.auto_cap = (720, 60)
+    w._reload()
+    assert w.auto_cap == (720, 60)
+
+
+def test_floor_can_be_changed_or_switched_off_in_settings(home):
+    from streamclipper import config
+    config.save(dict(config.load(), quality_floor="0"))
+    w = Worker("ch")
+    sent = []
+    w.emit = lambda **m: sent.append(m)
+    w.variants, w.quality = list(LADDER), "1080p60"
+    assert w._lower_quality(1.4, 2_500_000) is True      # как раньше: берётся то, что интернет тянет
+    assert w.auto_cap == (480, 30) and _events(sent) == [("slow_net", "1080p60", "480p")]
+    w.cfg = dict(w.cfg, quality_floor="480")
+    w.quality, w._reopen = "480p", False
+    assert w._lower_quality(1.4, 300_000) is False
+    assert sent[-1]["floor"] == 480 and sent[-1]["new"] == ""
 
 
 def test_worker_at_the_lowest_quality_complains_rarely(home):
@@ -215,7 +278,7 @@ def test_worker_at_the_lowest_quality_complains_rarely(home):
     assert w._lower_quality(2.0, 100_000) is False
     assert w._lower_quality(2.0, 100_000) is False       # проверка идёт каждые 5 секунд, а сказать надо один раз
     assert w.auto_cap is None and w._reopen is False
-    assert _events(sent) == [("slow_net", "160p", "")]
+    assert _events(sent) == [("slow_net", "160p", "")] and sent[0]["floor"] == 0     # ниже у стрима просто ничего нет
 
 
 class _Src:
@@ -234,7 +297,7 @@ def test_quality_change_reopens_the_stream_at_once_and_is_not_a_stream_end(home,
     def open_source():
         opened.append(w.auto_cap)
         w.variants = list(LADDER)
-        w.quality = "1080p60" if w.auto_cap is None else "480p"
+        w.quality = "1080p60" if w.auto_cap is None else "720p60"
         return _Src()
 
     def pump(src):
@@ -245,9 +308,9 @@ def test_quality_change_reopens_the_stream_at_once_and_is_not_a_stream_end(home,
 
     w._open_source, w._pump = open_source, pump
     w._record_loop()
-    assert opened == [None, (480, 30)]
+    assert opened == [None, (720, 60)]
     assert [(m["kind"], m.get("quality") or m.get("new")) for m in sent if m.get("t") == "event"] == [
-        ("online", "1080p60"), ("slow_net", "480p"), ("online", "480p")]
+        ("online", "1080p60"), ("slow_net", "720p60"), ("online", "720p60")]
     assert waits == []                                   # между качествами запись не ждёт
 
 
@@ -343,8 +406,18 @@ def test_slow_internet_is_said_in_plain_words(home, monkeypatch):
     assert said == ["ch: стрим в эфире, качество 1080p60",
                     "ch: интернет не успевает за качеством 1080p60, дальше записываю в 480p"]
     assert [k for k, _t in alerts] == ["slow-net"] and "Интернет не успевает" in alerts[0][1]
+    assert "но не ниже 720p" in alerts[0][1]
     _feed(sup, h, {"t": "event", "kind": "slow_net", "old": "160p", "new": ""})
     assert "даже за самым низким качеством" in _said(sup)[0]
+
+
+def test_not_enough_internet_even_for_720p_is_said_in_plain_words(home, monkeypatch):
+    sup, h, alerts = _sup(monkeypatch)
+    _feed(sup, h, {"t": "event", "kind": "slow_net", "old": "720p60", "new": "", "floor": 720})
+    assert _said(sup) == ["ch: интернет не успевает за качеством 720p60, а ниже 720p программа его не опускает. "
+                          "Убери часть стримов: пока интернета не хватает, запись идёт с дырами и клипов меньше"]
+    assert [k for k, _t in alerts] == ["slow-net-floor"]
+    assert "даже в 720p" in alerts[0][1] and "Убери один-два стрима" in alerts[0][1]
 
 
 def test_stream_card_shows_slow_internet_instead_of_no_data(home, monkeypatch):
