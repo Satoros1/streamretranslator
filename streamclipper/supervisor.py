@@ -147,7 +147,11 @@ class Supervisor:
         self.cpu = 0.0
         self.ram = 0.0
         self.free_gb = util.free_gb(self.cfg["clips_dir"])
-        self.update: tuple[str, str] | None = None
+        self.update: updater.Update | None = None       # вышла версия новее этой
+        self.self_update = updater.can_self_update()    # умеет ли эта копия программы поставить её сама
+        self._downloading = False
+        self._edit_proc: subprocess.Popen | None = None
+        self._edit_killed = False
         self._cpu_hot = 0
 
     # --- события для окна --------------------------------------------------
@@ -241,11 +245,15 @@ class Supervisor:
             threading.Thread(target=target, daemon=True, name=name).start()
         self.say(f"Запущено. Каналов: {len(self.workers)}")
 
-    def shutdown(self) -> None:
+    def shutdown(self, for_update: bool = False) -> None:
+        """for_update: программа закрывается, чтобы установщик поставил новую версию. Тогда начатый монтаж
+        прерывается (иначе он держал бы файлы программы): заготовка остаётся и монтируется после запуска."""
         self.stop.set()
         with self.lock:
             names = list(self.workers)
             self._stop_all(list(self.workers.values()))
+        if for_update:
+            self.kill_edit()
         self.tg.stop()
         system.prevent_sleep(False)
         # После выхода запись в буфере уже не пригодится, а это до 350 МБ на каждый стрим.
@@ -625,17 +633,49 @@ class Supervisor:
             # модели, сбой библиотеки), поэтому вторая идёт без него и без ИИ: клип важнее описания.
             env["STREAMCLIPPER_SAFE_EDIT"] = "1"
         try:
-            r = subprocess.run(util.worker_cmd("edit", job), stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
-                               stderr=subprocess.DEVNULL, timeout=1500,
-                               creationflags=util.NO_WINDOW | util.LOW_PRIORITY, env=env)
-            lines = r.stdout.decode("utf-8", "replace").strip().splitlines()
+            self._edit_proc = p = subprocess.Popen(
+                util.worker_cmd("edit", job), stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+                stderr=subprocess.DEVNULL, creationflags=util.NO_WINDOW | util.LOW_PRIORITY, env=env)
+            try:
+                out, _err = p.communicate(timeout=1500)
+            except subprocess.TimeoutExpired:
+                p.kill()
+                p.communicate()
+                raise
+            lines = out.decode("utf-8", "replace").strip().splitlines()
             res = json.loads(lines[-1]) if lines else {"ok": False, "error": "монтажёр ничего не ответил"}
         except subprocess.TimeoutExpired:
             res = {"ok": False, "error": "монтаж шёл дольше 25 минут"}
         except Exception as e:
             res = {"ok": False, "error": str(e)[:200]}
+        finally:
+            self._edit_proc = None
         self.editing = ""
+        if self._edit_killed:
+            return                                      # монтаж прерван ради обновления: заготовка ждёт следующего запуска
         self._edit_done(job, res, score, manual)
+
+    def kill_edit(self) -> None:
+        """Прерывает начатый монтаж вместе с его ffmpeg. Заготовка остаётся на диске."""
+        p = self._edit_proc
+        if p is None or p.poll() is not None:
+            return
+        self._edit_killed = True
+        procs = []
+        try:
+            import psutil
+            procs = psutil.Process(p.pid).children(recursive=True)
+        except Exception:
+            pass
+        for q in [p, *procs]:
+            try:
+                q.kill()
+            except Exception:
+                pass
+        try:
+            p.wait(5)
+        except Exception:
+            pass
 
     def _drop_job(self, job: str) -> None:
         for p in (job, job[:-5] + ".ts"):
@@ -780,14 +820,57 @@ class Supervisor:
                       + f"\nОтправлено: {self.stats.get('sent', 0)}, в очереди: {c.get('pending', 0)}"
                       + f"\nСвободно на диске: {self.free_gb:.0f} ГБ")
 
+    # --- обновление программы ---------------------------------------------
+    def _found_update(self, upd: updater.Update | None) -> None:
+        if upd is None:
+            return
+        self.update = upd
+        self.events.put({"t": "update", "version": upd.version, "url": upd.page,
+                         "auto": bool(upd.url) and self.self_update})
+
+    def check_update_now(self) -> None:
+        """Кнопка «Проверить обновления»: ответ приходит событием update, no_update или update_error."""
+        def work():
+            try:
+                upd = updater.fetch_update()
+            except Exception as e:
+                self.events.put({"t": "update_error", "error": str(e) or "нет связи с GitHub"})
+                return
+            if upd is None:
+                self.events.put({"t": "no_update"})
+            else:
+                self._found_update(upd)
+        threading.Thread(target=work, daemon=True, name="update-check").start()
+
+    def download_update(self) -> bool:
+        """Кнопка «Обновить»: качает установщик. Дальше событие update_ready (файл скачан и проверен: окно
+        запускает его и закрывает программу) или update_failed."""
+        upd = self.update
+        if upd is None or not upd.url or self._downloading:
+            return False
+        self._downloading = True
+        self.say(f"Скачиваю обновление {upd.version} ({upd.size / 1e6:.0f} МБ)")
+
+        def work():
+            try:
+                path = updater.download(upd, lambda pct: self.events.put({"t": "update_progress", "pct": pct}))
+            except Exception as e:
+                err = str(e) if isinstance(e, updater.UpdateError) else f"сбой ({e})"
+                self.say(f"Обновление {upd.version} не скачалось: {err}", "error")
+                self.events.put({"t": "update_failed", "error": err, "url": upd.page})
+            else:
+                self.events.put({"t": "update_ready", "path": str(path), "version": upd.version, "url": upd.page})
+            finally:
+                self._downloading = False
+        threading.Thread(target=work, daemon=True, name="update-download").start()
+        return True
+
     def _update_loop(self) -> None:
         if self.stop.wait(20):
             return
         while True:
             try:
-                self.update = updater.check_app_update()
-                if self.update:
-                    self.events.put({"t": "update", "version": self.update[0], "url": self.update[1]})
+                self._found_update(updater.check_app_update())
                 if self.cfg.get("auto_update_streamlink", True):
                     new = updater.update_streamlink()
                     if new:

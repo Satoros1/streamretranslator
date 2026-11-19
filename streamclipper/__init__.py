@@ -1,5 +1,5 @@
 """StreamClipper: записывает Twitch-стримы и сам режет смешные моменты."""
 
-__version__ = "0.1.2"
+__version__ = "0.1.3"
 APP_NAME = "StreamClipper"
 GITHUB_REPO = "Satoros1/streamretranslator"
