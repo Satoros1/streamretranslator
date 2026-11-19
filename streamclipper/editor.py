@@ -102,7 +102,7 @@ def cut_vertical(raw: str, start: float, dur: float, out: str, job: dict, cfg: d
     """Вертикальный клип 1080x1920. Чат и заголовок рисуются в отдельном процессе: если с ними что-то не так,
     клип выйдет без них."""
     from . import vrender
-    spec = {"raw": raw, "start": start, "dur": dur, "out": out, "layout": cfg.get("tt_layout", "big"),
+    spec = {"raw": raw, "start": start, "dur": dur, "out": out, "layout": cfg.get("tt_layout", "blur"),
             "style": cfg.get("chat_style", "soft"), "size": cfg.get("chat_size", "m"),
             "room_id": job.get("room_id", ""), "chat": [], "headline": headline}
     if spec["style"] != "off":

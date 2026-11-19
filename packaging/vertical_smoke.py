@@ -27,7 +27,7 @@ def main() -> int:
              "text": texts[i % len(texts)], "emotes": [[0, 4, "25"]] if texts[i % len(texts)].startswith("Kappa") else []}
             for i in range(22)]
     # room_id: настоящий большой канал, чтобы заодно проверить загрузку смайлов 7TV/BTTV/FFZ
-    spec = {"raw": raw, "start": 1.0, "dur": 8.0, "out": out, "layout": "big", "style": "soft", "size": "m",
+    spec = {"raw": raw, "start": 1.0, "dur": 8.0, "out": out, "layout": "blur", "style": "soft", "size": "m",
             "room_id": "71092938", "chat": chat, "headline": "угон инвалидной коляски в гта 6"}
     path = os.path.join(home, "spec.json")
     with open(path, "w", encoding="utf-8") as f:
