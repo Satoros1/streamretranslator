@@ -19,7 +19,7 @@ on:
 jobs:
   live:
     runs-on: windows-latest
-    timeout-minutes: 25
+    timeout-minutes: 80        # длинная проверка отбора: до 40 минут записи и время на монтаж
     steps:
       - uses: actions/checkout@v4
 
