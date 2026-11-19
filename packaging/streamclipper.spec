@@ -24,6 +24,8 @@ for pkg in ("streamlink", "anthropic"):
     except Exception:
         pass
 
+datas += [(os.path.join(root, "streamclipper", "assets"), os.path.join("streamclipper", "assets"))]
+
 a = Analysis([os.path.join(root, "packaging", "entry.py")], pathex=[root], binaries=binaries, datas=datas,
              hiddenimports=hidden, excludes=["tkinter", "matplotlib", "PyQt5", "PyQt6", "torch"], noarchive=False)
 pyz = PYZ(a.pure)
