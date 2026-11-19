@@ -205,8 +205,11 @@ class StreamCard(QFrame):
 
     def update_from(self, s: dict) -> None:
         hot = s["text"].startswith("🔥")
-        self.chip.setText(("● " if s["state"] == "live" and not hot else "") + s["text"])
-        restyle(self.chip, "chipHot" if hot else STATE_CHIP.get(s["state"], "chipGray"))
+        slow = bool(s.get("slow"))                       # интернет не успевает: это важнее, чем «идёт запись»
+        self.chip.setText(("● " if s["state"] == "live" and not hot and not slow else "") + s["text"])
+        self.chip.setToolTip("Видео с Twitch скачивается медленнее, чем идёт эфир. Программа сама снизит качество "
+                             "записи. Если не помогает, убери часть стримов." if slow else "")
+        restyle(self.chip, "chipHot" if hot else "chipWarn" if slow else STATE_CHIP.get(s["state"], "chipGray"))
         restyle(self, "cardHot" if hot else "card")
         self.title.setText(s.get("title") or ("Жду, когда стример выйдет в эфир" if s["state"] == "offline" else ""))
         self.title.setVisible(bool(self.title.text()))

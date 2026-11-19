@@ -132,7 +132,7 @@ def main() -> int:
                             "-vf", "scale=540:-2", os.path.join(out, "live_vertical_%d.jpg" % i)])
     # Хронология монтажа: успевает ли он за моментами. Печатается в конце, чтобы попасть в хвост лога.
     marks = ("пойман момент", "клип готов", "пропущен", "не удался", "не получился", "Запущено", "перезапускаю",
-             "стрим закончился")
+             "стрим закончился", "стрим в эфире", "интернет не успевает")
     caught = [ln for ln in text.splitlines() if "INFO supervisor" in ln and any(m in ln for m in marks)]
     print("TIMELINE (%d lines):" % len(caught))
     for ln in caught[:150]:
@@ -141,6 +141,11 @@ def main() -> int:
     print("moments caught: %d, clips made: %d, dropped as weakest: %d, left unedited: %s" % (
         sum("пойман момент" in ln for ln in caught), sum("клип готов" in ln for ln in caught),
         sum("Монтаж не успевает" in ln for ln in caught), left.group(1) if left else "0"))
+    # Проверка с зажатой скоростью: программа обязана сама заметить медленный интернет и снизить качество.
+    cap = os.environ.get("STREAMCLIPPER_NET_CAP_KBPS") or ""
+    lowered = sorted({ln.split("supervisor: ", 1)[-1].split(":")[0] for ln in caught if "дальше записываю в" in ln})
+    print("SLOW NET: speed cap %s kbit/s per stream, quality lowered on %d of %d streams: %s" % (
+        cap or "off", len(lowered), len(channels), lowered or "none"))
     if stuck:
         print("HEADLESS DID NOT FINISH: killed after %d s" % (int(seconds) + 900))
     made = sorted({os.path.basename(os.path.dirname(os.path.dirname(p))) for p in found})
@@ -149,7 +154,7 @@ def main() -> int:
     lossy = lost_video(home) + jumpy_clips(found)
     print("video lost on the way to disk or inside clips:", lossy or "none")
     # один канал мог как раз уйти на рекламу или закончить стрим
-    good = bool(found) and len(missing) <= 1 and not lossy and not stuck
+    good = bool(found) and len(missing) <= 1 and not lossy and not stuck and (not cap or bool(lowered))
     print("LIVE SMOKE:", "PASSED, clips: %d" % len(found) if good else "FAILED, clips: %d" % len(found))
     return 0 if good else 1
 

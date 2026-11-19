@@ -24,10 +24,11 @@ from .uploader import Telegram
 log = logging.getLogger("supervisor")
 
 HANG_SECONDS = 90
+OFFLINE_CONFIRM = 90  # эфир считается законченным, только если не вернулся за столько секунд
 EDIT_BACKLOG = 12     # столько моментов может ждать монтажа; когда их больше, самые слабые пропускаются
 STATE_RU = {
     "starting": "запускается", "offline": "не в эфире", "live": "идёт запись", "ad": "реклама, пропускаю",
-    "pause": "нет данных, жду", "error": "ошибка", "paused": "пауза", "restarting": "перезапуск",
+    "pause": "нет видео от Twitch, жду", "error": "ошибка", "paused": "пауза", "restarting": "перезапуск",
     "stopped": "остановлен",
 }
 
@@ -45,6 +46,8 @@ class WorkerHandle:
         self.clips = 0
         self.error_since = 0.0
         self.live_since = 0.0
+        self.online = False         # об эфире уже сказано человеку
+        self.off_at = 0.0           # когда запись сообщила о конце эфира; 0 = не сообщала
 
 
 class EditQueue:
@@ -286,11 +289,28 @@ class Supervisor:
                 elif t == "event":
                     k = msg.get("kind")
                     if k == "online":
-                        h.live_since = time.time()
-                        self.say(f"{h.name}: стрим в эфире, качество {msg.get('quality', '?')}")
+                        back = h.off_at
+                        h.off_at = 0.0
+                        if not h.online:
+                            h.online = True
+                            h.live_since = time.time()
+                            self.say(f"{h.name}: стрим в эфире, качество {msg.get('quality', '?')}")
+                        elif back:                      # короткий обрыв: эфир не кончался, человека не дёргаем
+                            log.info("%s: видео прерывалось на %d с и вернулось", h.name, time.time() - back)
                     elif k == "offline":
-                        self.say(f"{h.name}: стрим закончился")
-                        self.tg.alert(f"📴 {h.name}: стрим закончился. Жду следующего.", f"off-{h.name}", 600)
+                        # Обрыв связи выглядит так же, как конец эфира. Поэтому сначала ждём: вернётся ли стрим.
+                        if h.online and not h.off_at:
+                            h.off_at = time.time()
+                    elif k == "slow_net":
+                        if msg.get("new"):
+                            self.say(f"{h.name}: интернет не успевает за качеством {msg.get('old', '?')}, дальше "
+                                     f"записываю в {msg['new']}", "error")
+                        else:
+                            self.say(f"{h.name}: интернет не успевает даже за самым низким качеством. "
+                                     "Убери часть стримов", "error")
+                        self.tg.alert("📶 Интернет не успевает записывать все стримы сразу. Программа сама снижает "
+                                      "качество записи. Если так бывает часто, поставь в настройках качество пониже "
+                                      "или убери часть стримов.", "slow-net", 3600)
                     elif k == "no_video":
                         self.say(f"{h.name}: клип не сделан, в буфере пока нет видео", "error")
                     elif k == "disk_full":
@@ -362,6 +382,10 @@ class Supervisor:
     def _check(self, h: WorkerHandle, now: float) -> None:
         if self.stop.is_set() or self.recording_off:
             return                                      # программа закрывается: никого не перезапускаем
+        if h.off_at and now - h.off_at >= OFFLINE_CONFIRM:
+            h.off_at, h.online = 0.0, False             # эфир так и не вернулся: теперь это точно конец
+            self.say(f"{h.name}: стрим закончился")
+            self.tg.alert(f"📴 {h.name}: стрим закончился. Жду следующего.", f"off-{h.name}", 600)
         if h.proc is None:
             if now >= h.next_start:
                 self._spawn(h)
@@ -460,9 +484,12 @@ class Supervisor:
                 text = STATE_RU.get(state, state)
                 if state == "error" and s.get("detail"):
                     text += ": " + s["detail"][:60]
-                if state == "live" and s.get("hot"):
+                slow = bool(s.get("slow")) and state in ("live", "pause")
+                if slow:
+                    text = "интернет не успевает"
+                elif state == "live" and s.get("hot"):
                     text = "🔥 движ в чате!"
-                out.append({"name": h.name, "state": state, "text": text, "rate": s.get("rate", 0),
+                out.append({"name": h.name, "state": state, "text": text, "slow": slow, "rate": s.get("rate", 0),
                             "level": s.get("level", 0), "buf_mb": s.get("buf_mb", 0), "clips": h.clips,
                             "quality": s.get("quality", ""), "title": s.get("title", ""),
                             "chat": s.get("chat", False)})
