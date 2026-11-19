@@ -7,7 +7,6 @@ from __future__ import annotations
 import logging
 import os
 import re
-import tempfile
 
 from . import config, util
 
@@ -27,36 +26,36 @@ def transcribe(raw: str, start: float, end: float, cfg: dict) -> list[tuple[floa
     except Exception as e:
         log.info("Whisper недоступен в этой сборке: %s", e)
         return []
-    wav = os.path.join(tempfile.gettempdir(), f"sc_{os.getpid()}.wav")
     try:
-        r = util.run([util.find_tool("ffmpeg"), "-hide_banner", "-loglevel", "error", "-y", "-ss", f"{start:.2f}",
-                      "-i", raw, "-t", f"{end - start:.2f}", "-vn", "-ac", "1", "-ar", "16000", wav], timeout=120)
-        if r.returncode != 0 or not os.path.exists(wav):
+        import numpy as np
+        # Звук достаём ffmpeg-ом и отдаём распознаванию готовым массивом: так не нужен отдельный декодер звука
+        r = util.run([util.find_tool("ffmpeg"), "-hide_banner", "-loglevel", "error", "-ss", f"{start:.2f}",
+                      "-i", raw, "-t", f"{end - start:.2f}", "-vn", "-ac", "1", "-ar", "16000", "-f", "s16le", "pipe:1"],
+                     timeout=120)
+        if r.returncode != 0 or len(r.stdout) < 16000:
             return []
+        audio = np.frombuffer(r.stdout[: len(r.stdout) // 2 * 2], dtype="<i2").astype(np.float32) / 32768.0
         model = WhisperModel(cfg.get("whisper_model") or "small", device="cpu", compute_type="int8",
                              download_root=str(config.subdir("models")),
                              cpu_threads=max(2, min(6, (os.cpu_count() or 4) // 2)))
         kw = dict(language="ru", beam_size=2, condition_on_previous_text=False)
         try:
-            segs, _info = model.transcribe(wav, vad_filter=True, **kw)
+            segs, _info = model.transcribe(audio, vad_filter=True, **kw)
             segs = list(segs)
-        except Exception:
-            segs, _info = model.transcribe(wav, vad_filter=False, **kw)
+        except Exception as e:
+            log.info("распознавание с отсевом тишины не вышло (%s), пробую без него", e)
+            segs, _info = model.transcribe(audio, vad_filter=False, **kw)
             segs = list(segs)
         out = []
         for s in segs:
             text = (s.text or "").strip()
             if text and not _HALLU.search(text) and getattr(s, "no_speech_prob", 0) < 0.8:
                 out.append((start + s.start, start + s.end, text))
+        log.info("распознано фраз: %d", len(out))
         return out
     except Exception as e:
         log.warning("распознавание речи не удалось: %s", e)
         return []
-    finally:
-        try:
-            os.remove(wav)
-        except OSError:
-            pass
 
 
 SYSTEM = """Ты редактор нарезок с русскоязычных Twitch-стримов. Тебе дают кусок стрима в виде текста: \

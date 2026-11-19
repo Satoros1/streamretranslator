@@ -1,0 +1,66 @@
+name: live-check
+
+# Быстрая проверка записи настоящих стримов прямо из исходников, без сборки установщика.
+on:
+  workflow_dispatch:
+    inputs:
+      seconds:
+        description: Сколько секунд писать стримы
+        default: "150"
+      channels:
+        description: Каналы через пробел (пусто = самые популярные русские прямо сейчас)
+        default: ""
+  push:
+    branches: [live-check]
+
+jobs:
+  live:
+    runs-on: windows-latest
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Install
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: ffmpeg
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $names = gh release view latest -R BtbN/FFmpeg-Builds --json assets --jq ".assets[].name"
+          $pick = $names | Where-Object { $_ -match '^ffmpeg-n[\d.]+-latest-win64-gpl-shared-[\d.]+\.zip$' } | Sort-Object { [version](($_ -split '-')[1].TrimStart('n')) } | Select-Object -Last 1
+          if (-not $pick) { $pick = "ffmpeg-master-latest-win64-gpl-shared.zip" }
+          gh release download latest -R BtbN/FFmpeg-Builds -p $pick -O ffmpeg.zip
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+          Expand-Archive ffmpeg.zip -DestinationPath ffmpeg_tmp
+          New-Item -ItemType Directory -Force ffmpeg | Out-Null
+          Copy-Item ffmpeg_tmp\*\bin\*.dll ffmpeg\
+          Copy-Item ffmpeg_tmp\*\bin\ffmpeg.exe ffmpeg\
+          Copy-Item ffmpeg_tmp\*\bin\ffprobe.exe ffmpeg\
+          "$PWD\ffmpeg" | Out-File -FilePath $env:GITHUB_PATH -Append
+
+      - name: Record live streams
+        shell: pwsh
+        env:
+          PYTHONUTF8: "1"
+          STREAMCLIPPER_DUMP: "1"
+          SMOKE_OUT: smoke_clips
+        run: |
+          $sec = "${{ github.event.inputs.seconds }}"
+          if (-not $sec) { $sec = "150" }
+          python packaging/live_smoke.py "python -m streamclipper" $sec ${{ github.event.inputs.channels }}
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: live-check
+          path: smoke_clips/*
+          if-no-files-found: ignore

@@ -47,7 +47,7 @@ def main() -> int:
     with open(os.path.join(home, "config.json"), "w", encoding="utf-8") as f:
         json.dump({"clips_dir": clips, "whisper": True, "whisper_model": "base", "manual_len": 30,
                    "auto_update_streamlink": True, "max_streams": 8, "clip_format": "both"}, f)
-    channels = (live_ru() or FALLBACK)[:6]
+    channels = sys.argv[3:] or (live_ru(6) or FALLBACK)[:6]
     print("channels:", channels)
     env = dict(os.environ, STREAMCLIPPER_HOME=home, PYTHONIOENCODING="utf-8", PYTHONUTF8="1")
     cmd = exe.split() + ["headless", seconds] + channels
@@ -56,7 +56,15 @@ def main() -> int:
     for log in glob.glob(os.path.join(home, "logs", "*.log")):
         print("=====", os.path.basename(log))
         with open(log, encoding="utf-8", errors="replace") as f:
-            print(f.read()[-3000:])
+            print(f.read()[-6000:])
+    for dump in glob.glob(os.path.join(home, "logs", "dump_*.bin")):     # что именно прислал Twitch: формат и кодеки
+        pr = subprocess.run(["ffprobe", "-v", "error", "-show_entries",
+                             "format=format_name:stream=index,codec_type,codec_name,profile,width,height,r_frame_rate",
+                             "-of", "compact", dump], stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+        with open(dump, "rb") as f:
+            head = f.read(16)
+        print("DUMP", os.path.basename(dump), os.path.getsize(dump), "bytes, head", head.hex(),
+              "|", pr.stdout.decode("utf-8", "replace").strip().replace("\n", " ; ")[:900])
     found = glob.glob(os.path.join(clips, "**", "*.mp4"), recursive=True)
     for p in found:
         print("CLIP", os.path.getsize(p) // 1024, "KB", p)

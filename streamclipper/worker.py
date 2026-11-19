@@ -16,6 +16,7 @@ import re
 import shlex
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 import uuid
@@ -154,6 +155,7 @@ class Worker:
             pass
         name = pick_quality(list(streams), self.cfg.get("quality", "best"))
         self.quality = name
+        log.info("качества стрима: %s; беру %s (%s)", ", ".join(streams), name, type(streams[name]).__name__)
         return streams[name].open()
 
     def _start_ffmpeg(self) -> subprocess.Popen:
@@ -162,8 +164,11 @@ class Worker:
                "-f", "mpegts", "-i", "pipe:0", "-map", "0:v:0?", "-map", "0:a:0?", "-c", "copy",
                "-f", "segment", "-segment_time", str(segments.SEG_TIME), "-segment_format", "mpegts",
                "-strftime", "1", "-reset_timestamps", "0", segments.seg_pattern(self.buf_dir, self.run_no)]
-        return subprocess.Popen(cmd, stdin=subprocess.PIPE, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-                                creationflags=util.NO_WINDOW)
+        err = tempfile.TemporaryFile()
+        ff = subprocess.Popen(cmd, stdin=subprocess.PIPE, stdout=subprocess.DEVNULL, stderr=err,
+                              creationflags=util.NO_WINDOW)
+        ff.err = err                                    # type: ignore[attr-defined]
+        return ff
 
     @staticmethod
     def _close_ffmpeg(ff: subprocess.Popen | None) -> None:
@@ -177,6 +182,18 @@ class Worker:
             ff.wait(8)
         except subprocess.TimeoutExpired:
             ff.kill()
+        err = getattr(ff, "err", None)
+        if err is not None:
+            try:
+                err.seek(0)
+                text = err.read().decode("utf-8", "replace").strip()
+                if text or ff.returncode not in (0, None):
+                    log.warning("ffmpeg записи завершился с кодом %s: %s", ff.returncode, text[-500:] or "без сообщений")
+            except (OSError, ValueError):
+                pass
+            finally:
+                err.close()
+                ff.err = None                           # type: ignore[attr-defined]
 
     def _pump(self, src) -> None:
         q: queue.Queue = queue.Queue(maxsize=512)
@@ -195,8 +212,17 @@ class Worker:
         threading.Thread(target=reader, daemon=True, name="reader").start()
         ff = None
         last = time.time()
+        got, report_at, t_open = 0, time.time() + 25, time.time()
+        dump = None
+        if os.environ.get("STREAMCLIPPER_DUMP"):         # для проверки: первые мегабайты потока как есть
+            dump = open(config.subdir("logs") / f"dump_{self.channel}.bin", "wb")
         try:
             while not self.stop.is_set() and not self.cfg.get("paused"):
+                if time.time() >= report_at:
+                    segs = segments.scan(self.buf_dir)
+                    log.info("за %d с получено %.1f МБ видео, на диске %d кусков (%.1f МБ)", time.time() - t_open,
+                             got / 1e6, len(segs), sum(os.path.getsize(x.path) for x in segs if os.path.exists(x.path)) / 1e6)
+                    report_at = time.time() + (60 if time.time() - t_open < 200 else 900)
                 try:
                     chunk = q.get(timeout=1.0)
                 except queue.Empty:
@@ -210,6 +236,12 @@ class Worker:
                     continue
                 if chunk is None:
                     break
+                got += len(chunk)
+                if dump is not None:
+                    dump.write(chunk)
+                    if dump.tell() > 6_000_000:
+                        dump.close()
+                        dump = None
                 if ff is None or ff.poll() is not None:
                     self._close_ffmpeg(ff)
                     ff = self._start_ffmpeg()
@@ -222,6 +254,8 @@ class Worker:
                 last = time.time()
         finally:
             self._close_ffmpeg(ff)
+            if dump is not None:
+                dump.close()
 
     def _record_loop(self) -> None:
         fails = 0
@@ -455,6 +489,9 @@ def _watch_ads(worker: Worker) -> None:
                 log.info("реклама %s с: пропускаю", m.group(1))
             elif "pre-roll" in msg:
                 worker.ad_until = time.time() + 30
+                log.info("реклама перед стримом: жду, пока закончится")
+            elif record.levelno >= logging.INFO:
+                log.info("streamlink: %s", msg[:300])
 
     logging.getLogger("streamlink").addHandler(H())
     logging.getLogger("streamlink").setLevel(logging.INFO)
