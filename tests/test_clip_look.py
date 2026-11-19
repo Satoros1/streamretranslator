@@ -146,13 +146,16 @@ def test_default_clip_shows_the_stream_from_edge_to_edge(tmp_path, monkeypatch):
     out = str(tmp_path / "clip_9x16.mp4")
     cfg = config.load()
     chat = [[2.0 + i * 0.5, f"user{i}", "", "АХАХАХ", []] for i in range(10)]
-    assert editor.cut_vertical(raw, 1.0, 9.0, out, {"chatlog": chat, "room_id": ""}, cfg, "вебка на месте")
+    job = {"kind": "hype", "chatlog": chat, "room_id": ""}
+    title = describe.headline(job, "Чат в шоке", False, cfg)
+    assert title == ""                                           # по умолчанию надписи над видео нет
+    assert editor.cut_vertical(raw, 1.0, 9.0, out, job, cfg, title)
     shot = str(tmp_path / "shot.png")
     subprocess.run(["ffmpeg", "-hide_banner", "-loglevel", "error", "-y", "-ss", "5", "-i", out, "-frames:v", "1", shot])
     from PySide6.QtGui import QImage
     img = QImage(shot)
     assert (img.width(), img.height()) == (1080, 1920)
-    geo = vrender.geometry(cfg["tt_layout"], 1920, 1080, chat=True, title=True)
+    geo = vrender.geometry(cfg["tt_layout"], 1920, 1080, chat=True, title=False)
     y = geo["vy"] + geo["fg_h"] // 2
     left, right, mid = img.pixelColor(8, y), img.pixelColor(1080 - 9, y), img.pixelColor(540, y)
     assert left.red() > 180 and left.blue() < 80, left.getRgb()                  # левый край стрима в кадре
@@ -161,6 +164,9 @@ def test_default_clip_shows_the_stream_from_edge_to_edge(tmp_path, monkeypatch):
     # полосы видны во всю свою ширину: 160 из 1920 точек стрима это 90 точек клипа
     assert img.pixelColor(80, y).red() > 180 and img.pixelColor(100, y).green() > 120
     assert img.pixelColor(1080 - 81, y).blue() > 180 and img.pixelColor(1080 - 101, y).green() > 120
+    # над видео нет плашки с белыми буквами: только размытый фон
+    above = [img.pixelColor(x, yy).lightness() for yy in range(geo["vy"] - 200, geo["vy"] - 20, 4) for x in range(100, 980, 4)]
+    assert max(above) < 200, max(above)
 
 
 # ---- что написать над видео ----
@@ -290,13 +296,13 @@ def test_ai_without_frames_and_for_a_manual_clip(ai, tmp_path):
 
 def test_whole_stream_becomes_the_default_once(tmp_path, monkeypatch):
     monkeypatch.setenv("STREAMCLIPPER_HOME", str(tmp_path / "home"))
-    assert config.load()["tt_layout"] == "blur" and config.load()["tt_title"] is True    # новая установка
+    assert config.load()["tt_layout"] == "blur" and config.load()["tt_title"] is False   # новая установка
     path = config.config_path()
     path.parent.mkdir(parents=True, exist_ok=True)
     # настройки от 0.1.2 и 0.1.3: там основным был вид «крупно», он срезал края стрима
     path.write_text(json.dumps({"tt_layout": "big", "look": 1, "channels": ["a"]}), encoding="utf-8")
     cfg = config.load()
-    assert cfg["tt_layout"] == "blur" and cfg["look"] == 2 and cfg["channels"] == ["a"]
+    assert cfg["tt_layout"] == "blur" and cfg["look"] == config.LOOK and cfg["channels"] == ["a"]
     path.write_text(json.dumps({"tt_layout": "blur", "channels": ["a"]}), encoding="utf-8")       # настройки от 0.1.1
     assert config.load()["tt_layout"] == "blur"
     path.write_text(json.dumps({"tt_layout": "crop", "look": 1}), encoding="utf-8")       # выбирал вид сам: не трогаем
@@ -304,6 +310,22 @@ def test_whole_stream_becomes_the_default_once(tmp_path, monkeypatch):
     cfg = dict(config.load(), tt_layout="big")                   # выбрал «крупно» уже в новой версии
     config.save(cfg)
     assert config.load()["tt_layout"] == "big"                   # и оно остаётся
+
+
+def test_headline_is_off_by_default_once(tmp_path, monkeypatch):
+    """Надпись над видео была включена у всех с 0.1.2. Теперь клип по умолчанию без неё: выключаем один раз."""
+    monkeypatch.setenv("STREAMCLIPPER_HOME", str(tmp_path / "home"))
+    path = config.config_path()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    for look in (1, 2):                                          # настройки от 0.1.2, 0.1.3 и от 0.1.4
+        path.write_text(json.dumps({"tt_title": True, "look": look}), encoding="utf-8")
+        cfg = config.load()
+        assert cfg["tt_title"] is False and cfg["look"] == config.LOOK
+        assert describe.headline({"kind": "hype"}, "Чат в шоке", False, cfg) == ""
+    path.write_text(json.dumps({"tt_title": True, "tt_title_text": "GTA 6", "look": 2}), encoding="utf-8")
+    assert config.load()["tt_title"] is True                     # свой текст вписывал сам: надпись остаётся
+    config.save(dict(config.load(), tt_title=True, tt_title_text=""))        # включил надпись уже в новой версии
+    assert config.load()["tt_title"] is True                     # и она остаётся
 
 
 def test_settings_offer_the_whole_stream_first():
@@ -334,7 +356,7 @@ def test_vertical_clip_with_headline_and_chat(tmp_path, monkeypatch):
     pytest.importorskip("PySide6")
     monkeypatch.setenv("STREAMCLIPPER_HOME", str(tmp_path / "home"))
     monkeypatch.setenv("QT_QPA_PLATFORM", "offscreen")
-    config.save(dict(config.load(), clips_dir=str(tmp_path / "clips"), whisper=False, lead_in=8,
+    config.save(dict(config.load(), clips_dir=str(tmp_path / "clips"), whisper=False, lead_in=8, tt_title=True,
                      tt_title_text="угон инвалидной коляски в гта 6"))
     raw = _video(config.subdir("candidates") / "ch_20261119_210000_aaaaaa.ts", 50, "1280x720")
     res = editor.process(_job_file(tmp_path, raw))
