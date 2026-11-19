@@ -24,7 +24,7 @@ from pathlib import Path
 
 from . import config, mp4stream, segments, util
 from .chat import ChatClient
-from .detector import Detector, Event
+from .detector import WARMUP, Detector, Event
 from .learning import Learner, learnable, tokenize
 
 log = logging.getLogger("worker")
@@ -35,6 +35,9 @@ POST_ROLL = 8
 MAX_RAW = 170
 CHAT_KEEP = 300       # сколько секунд чата помнить для показа поверх клипа
 STALL = 50            # видео идёт, а новых кусков на диске нет столько секунд = запись сломалась
+PUMP_HANG = 60        # цикл записи молчит столько секунд = завис (обычно на зависшем ffmpeg)
+LIVE_RESET = 300      # видео не было дольше этого и появилось = стрим начался заново, норму чата учим с нуля
+CHAT_RESET = 120      # чат был недоступен дольше этого = его норму тоже учим заново
 
 
 class Worker:
@@ -67,6 +70,12 @@ class Worker:
         # чат последних минут с цветами ников и смайлами: из него рисуется чат поверх клипа
         self.chatlog: collections.deque = collections.deque()
         self.chat_lock = threading.Lock()
+        self.pump_beat = 0.0                             # когда цикл записи последний раз «дышал»; 0 = запись не идёт
+        self.ff_cur: subprocess.Popen | None = None      # текущий ffmpeg записи (для сторожа)
+        self.last_video = 0.0                            # когда в последний раз приходило видео
+        self.chat_down_since = 0.0
+        self._hang_acted = 0.0
+        self._grace_until = 0.0
 
     def _apply_learning(self) -> None:
         """Подхватывает то, чему программа научилась на оценках: порог и словарь этого канала."""
@@ -171,6 +180,7 @@ class Worker:
         ff = subprocess.Popen(recorder_cmd(self.buf_dir, self.run_no, kind), stdin=subprocess.PIPE,
                               stdout=subprocess.DEVNULL, stderr=err, creationflags=util.NO_WINDOW)
         ff.err = err                                    # type: ignore[attr-defined]
+        self.ff_cur = ff
         return ff
 
     @staticmethod
@@ -185,6 +195,10 @@ class Worker:
             ff.wait(8)
         except subprocess.TimeoutExpired:
             ff.kill()
+            try:
+                ff.wait(5)
+            except subprocess.TimeoutExpired:
+                pass
         err = getattr(ff, "err", None)
         if err is not None:
             try:
@@ -202,20 +216,42 @@ class Worker:
 
     def _pump(self, src) -> None:
         q: queue.Queue = queue.Queue(maxsize=512)
+        done = threading.Event()                         # запись окончена: поток чтения выходит, а не ждёт места в очереди
+
+        def hand_over(item) -> None:
+            while not done.is_set():
+                try:
+                    q.put(item, timeout=1.0)
+                    return
+                except queue.Full:
+                    continue
 
         def reader():
             try:
-                while not self.stop.is_set():
+                while not self.stop.is_set() and not done.is_set():
                     data = src.read(188 * 512)
                     if not data:
                         break
-                    q.put(data)
+                    hand_over(data)
             except Exception as e:
                 log.info("поток закончился: %s", e)
-            q.put(None)
+            hand_over(None)
 
         threading.Thread(target=reader, daemon=True, name="reader").start()
         ff = None
+        ff_started, ff_fails, ff_retry_at = 0.0, 0, 0.0
+
+        def ff_died() -> None:
+            """ffmpeg записи завершился сам. Если он падает сразу после запуска раз за разом (нет места на диске,
+            антивирус), не запускаем его заново на каждый кусок данных, а делаем паузы."""
+            nonlocal ff_fails, ff_retry_at
+            ff_fails = ff_fails + 1 if time.time() - ff_started < 20 else 0
+            if ff_fails >= 3:
+                wait = min(5.0 * 2 ** (ff_fails - 3), 60.0)
+                ff_retry_at = time.time() + wait
+                self.detail = "видео не записывается, проверь свободное место на диске"
+                log.warning("ffmpeg записи падает сразу после запуска (%d раз подряд): следующая попытка через %d с",
+                            ff_fails, wait)
         last = time.time()
         got, report_at, t_open = 0, time.time() + 25, time.time()
         health_at, got_mark, flowing_since = time.time() + 15, 0, time.time()
@@ -228,6 +264,7 @@ class Worker:
         try:
             while not self.stop.is_set() and not self.cfg.get("paused"):
                 now = time.time()
+                self.pump_beat = now
                 if now >= report_at:
                     segs = segments.scan(self.buf_dir)
                     log.info("за %d с получено %.1f МБ видео, на диске %d кусков (%.1f МБ)", now - t_open,
@@ -269,17 +306,29 @@ class Worker:
                     kind = mp4stream.sniff(chunk)
                     boxes = mp4stream.Mp4Boxes() if kind == "mp4" else None
                     log.info("вид потока: %s", {"mp4": "fMP4", "ts": "MPEG-TS"}.get(kind, "не распознан"))
-                self.state = "live"
                 last = time.time()
+                self.state = "error" if last < ff_retry_at else "live"
+                if last - self.last_video > LIVE_RESET:  # стрим только что начался или вернулся после долгого перерыва
+                    with self.det_lock:
+                        self.det.restart(last)
+                    log.info("видео пошло: норму чата считаю заново, первые моменты ловлю через %d с", WARMUP)
+                self.last_video = last
                 if boxes is None:                        # MPEG-TS: можно писать с любого места
-                    if ff is None or ff.poll() is not None:
+                    if ff is not None and ff.poll() is not None:
                         self._close_ffmpeg(ff)
+                        ff = None
+                        ff_died()
+                    if ff is None:
+                        if time.time() < ff_retry_at:
+                            continue
                         ff = self._start_ffmpeg(kind)
+                        ff_started = time.time()
                     try:
                         ff.stdin.write(chunk)
                     except OSError:
                         self._close_ffmpeg(ff)
                         ff = None
+                        ff_died()
                     continue
                 for box, piece, is_start in boxes.feed(chunk):
                     if box in mp4stream.WHOLE:           # заголовок: запоминаем и отдаём каждому новому ffmpeg
@@ -296,17 +345,22 @@ class Worker:
                     if ff is not None and ff.poll() is not None:
                         self._close_ffmpeg(ff)
                         ff = None
+                        ff_died()
                     if ff is None:
-                        if not init or not is_start or box == b"mdat":
+                        if not init or not is_start or box == b"mdat" or time.time() < ff_retry_at:
                             continue                     # ждём границы следующего куска видео
                         ff = self._start_ffmpeg(kind)
+                        ff_started = time.time()
                         piece = init + piece
                     try:
                         ff.stdin.write(piece)
                     except OSError:
                         self._close_ffmpeg(ff)
                         ff = None
+                        ff_died()
         finally:
+            self.pump_beat = 0.0
+            done.set()
             self._close_ffmpeg(ff)
             if dump is not None:
                 dump.close()
@@ -337,13 +391,16 @@ class Worker:
             log.info("стрим в эфире, качество %s", self.quality)
             self.emit(t="event", kind="online", title=self.title, quality=self.quality)
             started = time.time()
+            clean = True
             try:
                 self._pump(src)
             except FileNotFoundError:
+                clean = False
                 self.state, self.detail = "error", "не найден ffmpeg, переустанови программу"
                 log.error("ffmpeg не найден: %s", util.find_tool("ffmpeg"))
                 self.stop.wait(30)
             except Exception:
+                clean = False
                 log.exception("ошибка записи")
             finally:
                 try:
@@ -352,7 +409,8 @@ class Worker:
                     pass
             if not self.stop.is_set() and self.state != "error":
                 self.state = "offline"
-                if time.time() - started > 120:
+                # пауза и сбой записи: это не конец стрима, уведомление «стрим закончился» не нужно
+                if clean and not self.cfg.get("paused") and time.time() - started > 120:
                     self.emit(t="event", kind="offline")
                 self.stop.wait(8)
 
@@ -440,6 +498,40 @@ class Worker:
         except Exception:
             log.exception("не получилось собрать заготовку клипа")
 
+    # --- сторожа ----------------------------------------------------------
+    def _watchdog(self, now: float) -> None:
+        """Цикл записи обязан «дышать» раз в секунду. Замолчал: сначала снимаем зависший ffmpeg,
+        а если не помогло, завершаем процесс канала, и главный процесс запустит его заново."""
+        beat = self.pump_beat
+        if not beat or now - beat <= PUMP_HANG or now < self._grace_until:
+            self._hang_acted = 0.0
+            return
+        if not self._hang_acted:
+            self._hang_acted = now
+            log.warning("запись не отвечает %d с: останавливаю зависший ffmpeg", now - beat)
+            ff = self.ff_cur
+            if ff is not None and ff.poll() is None:
+                try:
+                    ff.kill()
+                except OSError:
+                    pass
+        elif now - self._hang_acted > PUMP_HANG:
+            log.error("запись так и не ожила: перезапускаю процесс канала")
+            logging.shutdown()
+            os._exit(75)
+
+    def _watch_chat(self, now: float) -> None:
+        """Чат долго был недоступен (пропал интернет): после возвращения обычный поток сообщений
+        не должен выглядеть всплеском на фоне тишины."""
+        if self.chat.connected:
+            if self.chat_down_since and now - self.chat_down_since > CHAT_RESET:
+                with self.det_lock:
+                    self.det.restart(now)
+                log.info("чат вернулся после перерыва %d с: его норму считаю заново", now - self.chat_down_since)
+            self.chat_down_since = 0.0
+        elif not self.chat_down_since:
+            self.chat_down_since = now
+
     # --- главный цикл ---------------------------------------------------
     def run(self) -> int:
         threading.Thread(target=self._stdin_loop, daemon=True, name="stdin").start()
@@ -450,10 +542,16 @@ class Worker:
             self.chat.start()
         _watch_ads(self)
         n = 0
+        last_tick = time.time()
         while not self.stop.is_set():
             time.sleep(1.0)
             n += 1
             now = time.time()
+            if now - last_tick > 15:                     # компьютер спал или завис целиком: это не поломка записи
+                self._grace_until = now + PUMP_HANG
+            last_tick = now
+            self._watchdog(now)
+            self._watch_chat(now)
             while True:
                 try:
                     cmd = self.cmds.get_nowait()

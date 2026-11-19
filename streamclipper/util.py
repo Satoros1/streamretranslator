@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import logging
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -12,6 +13,13 @@ from pathlib import Path
 from . import config
 
 NO_WINDOW = 0x08000000 if sys.platform == "win32" else 0
+# Монтаж клипа грузит процессор. С пониженным приоритетом (его наследуют и ffmpeg, и рисование чата)
+# он не отнимает время у записи стримов и не мешает работать за компьютером.
+LOW_PRIORITY = 0x00004000 if sys.platform == "win32" else 0
+
+# Имя клипа, которое даёт сама программа: канал_дата_время_оценка[_заголовок][_9x16].mp4 в папке с датой
+_CLIP_RE = re.compile(r"[a-z0-9_]+_\d{4}-\d\d-\d\d_\d\d-\d\d-\d\d_\d{3}(?:_.*)?\.mp4$", re.I)
+_DAY_RE = re.compile(r"\d{4}-\d\d-\d\d$")
 
 
 def frozen() -> bool:
@@ -94,6 +102,39 @@ def dir_size(path: str | os.PathLike) -> int:
             except OSError:
                 pass
     return total
+
+
+def own_clip(path: str | os.PathLike) -> bool:
+    """Наш ли это клип. Удалять можно только то, что программа сделала сама: в папке клипов
+    могут лежать и чужие видео, если человек выбрал для клипов общую папку или целый диск."""
+    p = Path(path)
+    return bool(_CLIP_RE.fullmatch(p.name)) and bool(_DAY_RE.fullmatch(p.parent.name))
+
+
+def clip_twin(path: str) -> str:
+    """Второй файл того же клипа: у вертикального это обычный 16:9, и наоборот."""
+    if path.endswith("_9x16.mp4"):
+        return path[:-9] + ".mp4"
+    return path[:-4] + "_9x16.mp4" if path.endswith(".mp4") else path
+
+
+def remove_clip(path: str) -> bool:
+    """Удаляет файл клипа. Описание (.txt) общее на оба файла клипа и уходит вместе с последним из них."""
+    try:
+        os.remove(path)
+    except OSError:
+        return False
+    if not os.path.exists(clip_twin(path)):
+        wide = clip_twin(path) if path.endswith("_9x16.mp4") else path
+        try:
+            os.remove(os.path.splitext(wide)[0] + ".txt")
+        except OSError:
+            pass
+        try:
+            os.rmdir(os.path.dirname(path))               # папка дня опустела: убираем и её
+        except OSError:
+            pass
+    return True
 
 
 def fmt_dur(sec: float) -> str:

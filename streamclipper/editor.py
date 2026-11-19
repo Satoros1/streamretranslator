@@ -131,8 +131,27 @@ def probe_duration(path: str) -> float:
         return 0.0
 
 
+def clip_folder(cfg: dict, channel: str, day: str) -> Path:
+    """Папка для клипа. Если выбранная в настройках недоступна (вынули диск), момент не теряем:
+    клип ложится в папку по умолчанию."""
+    last: OSError | None = None
+    for root in dict.fromkeys((cfg["clips_dir"], config.default_clips_dir())):
+        folder = Path(root) / channel / day
+        try:
+            folder.mkdir(parents=True, exist_ok=True)
+            return folder
+        except OSError as e:
+            last = e
+            log.warning("папка клипов %s недоступна: %s", root, e)
+    raise last or OSError("нет папки для клипов")
+
+
 def process(job_path: str) -> dict:
     cfg = config.load()
+    if os.environ.get("STREAMCLIPPER_SAFE_EDIT"):
+        # вторая попытка после сбоя: без распознавания речи и без ИИ, лишь бы клип вышел
+        cfg = dict(cfg, whisper=False, ai_enabled=False)
+        log.info("повторный монтаж в щадящем режиме: без распознавания речи и ИИ")
     with open(job_path, "r", encoding="utf-8") as f:
         job = json.load(f)
     raw = job["raw"]
@@ -177,9 +196,8 @@ def process(job_path: str) -> dict:
     dur = end - start
 
     when = time.localtime(job["raw_start"] + start)
-    folder = Path(cfg["clips_dir"]) / job["channel"] / time.strftime("%Y-%m-%d", when)
-    folder.mkdir(parents=True, exist_ok=True)
-    safe_title = re.sub(r'[\\/:*?"<>|\r\n]+', " ", title).strip()[:50]
+    folder = clip_folder(cfg, job["channel"], time.strftime("%Y-%m-%d", when))
+    safe_title = re.sub(r'[\\/:*?"<>|\x00-\x1f]+', " ", title).strip()[:50]      # всё, что Windows не терпит в именах
     name = f"{job['channel']}_{time.strftime('%Y-%m-%d_%H-%M-%S', when)}_{score:03d}_{safe_title}".rstrip(" ._")
     fmt = cfg.get("clip_format", "tiktok")
     wide, tall = str(folder / (name + ".mp4")), str(folder / (name + "_9x16.mp4"))
