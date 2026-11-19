@@ -79,7 +79,7 @@ def clock(monkeypatch):
         slept.append(sec)
         t[0] += sec
 
-    monkeypatch.setattr(netmeter.time, "monotonic", lambda: t[0])
+    monkeypatch.setattr(netmeter.time, "perf_counter", lambda: t[0])
     monkeypatch.setattr(netmeter.time, "sleep", sleep)
     t.append(slept)
     return t
