@@ -21,6 +21,8 @@ WizardStyle=modern
 SetupIconFile=streamclipper.ico
 UninstallDisplayIcon={app}\StreamClipper.exe
 CloseApplications=force
+; журнал установки в папке TEMP: по нему видно, почему обновление не поставилось
+SetupLogging=yes
 ArchitecturesInstallIn64BitMode=x64compatible
 ArchitecturesAllowed=x64compatible
 
@@ -39,6 +41,34 @@ Name: "{autodesktop}\StreamClipper"; Filename: "{app}\StreamClipper.exe"; Tasks:
 
 [Run]
 Filename: "{app}\StreamClipper.exe"; Description: "Запустить StreamClipper"; Flags: nowait postinstall skipifsilent
+; Обновление кнопкой из самой программы: она запускает установщик с ключом /UPDATE=1 и закрывается,
+; а установщик после установки открывает новую версию.
+Filename: "{app}\StreamClipper.exe"; Parameters: "--updated"; Flags: nowait; Check: IsUpdate
 
 [UninstallRun]
 Filename: "{cmd}"; Parameters: "/C taskkill /IM StreamClipper.exe /F & taskkill /IM sc-worker.exe /F"; Flags: runhidden; RunOnceId: "KillApp"
+
+[Code]
+function IsUpdate: Boolean;
+begin
+  Result := ExpandConstant('{param:UPDATE|0}') = '1';
+end;
+
+// Программа запустила установщик и закрывается: останавливает запись стримов и свои служебные процессы.
+// Пока она это делает, её файлы заняты. Ждём до минуты; если не дождались, установщик закроет её сам
+// (CloseApplications=force).
+function InitializeSetup: Boolean;
+var
+  Waited: Integer;
+begin
+  Result := True;
+  if IsUpdate then
+  begin
+    Waited := 0;
+    while CheckForMutexes('StreamClipper_single_instance') and (Waited < 240) do
+    begin
+      Sleep(250);
+      Waited := Waited + 1;
+    end;
+  end;
+end;

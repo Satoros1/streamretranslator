@@ -15,7 +15,7 @@ from PySide6.QtWidgets import (QApplication, QCheckBox, QComboBox, QFileDialog, 
                                QScrollArea, QSlider, QSpinBox, QStackedWidget, QSystemTrayIcon, QToolButton,
                                QVBoxLayout, QWidget)
 
-from . import APP_NAME, __version__, bible, config, system, util
+from . import APP_NAME, __version__, bible, config, system, updater, util
 from .supervisor import Supervisor
 from .uploader import TG_KEYS, pick_channel, summarize_test
 from .ui import theme as T
@@ -245,7 +245,10 @@ class MainWindow(QWidget):
         self.bridge = Bridge()
         self.cards: dict[str, StreamCard] = {}
         self.really_quit = False
-        self.update_url: str | None = None
+        self.for_update = False                 # программа закрывается, чтобы установщик поставил новую версию
+        self.upd: dict = {}                     # найденное обновление: version, url, auto, state
+        self.update_manual = False              # в прошлый раз установщик не справился: предлагаем скачать руками
+        self.update_unattended = False          # только для проверки сборки: обновляться без вопроса
         self.setObjectName("root")
         self.setWindowTitle(APP_NAME)
         self.setWindowIcon(T.app_icon())
@@ -259,9 +262,14 @@ class MainWindow(QWidget):
         self.update_bar.setObjectName("updateBar")
         ub = QHBoxLayout(self.update_bar)
         ub.setContentsMargins(20, 8, 20, 8)
-        self.update_label = label("")
+        self.update_label = label("", wrap=True)
         ub.addWidget(self.update_label, 1)
-        self.update_btn = button("Скачать", "primary")
+        self.update_alt = button("Скачать вручную")
+        self.update_alt.clicked.connect(lambda: webbrowser.open(self.upd.get("url") or updater.PAGE))
+        self.update_alt.hide()
+        ub.addWidget(self.update_alt)
+        self.update_btn = button("Обновить", "primary")
+        self.update_btn.clicked.connect(self.update_clicked)
         ub.addWidget(self.update_btn)
         self.update_bar.hide()
         outer.addWidget(self.update_bar)
@@ -964,6 +972,20 @@ class MainWindow(QWidget):
                 self.fields[key] = (kind, w)
                 cl.addWidget(setting_row(title, desc, w, last=i == len(rows) - 1))
             lay.addWidget(c)
+        c, cl = card()
+        cl.setSpacing(0)
+        cl.addWidget(label("Обновление программы", "h2"))
+        self.check_btn = button("Проверить обновления")
+        self.check_btn.clicked.connect(self.check_updates)
+        how = ("сверху появится полоска с кнопкой «Обновить»: программа сама скачает новую версию, поставит её "
+               "и откроется заново." if self.sup.self_update else
+               "сверху появится полоска с кнопкой «Скачать».")
+        cl.addWidget(setting_row(f"Установлена версия {__version__}", "Программа сама проверяет, не вышла ли новая: "
+                                 "при запуске и дважды в сутки. Когда выйдет, " + how, self.check_btn, last=True))
+        self.check_label = label("", "small", wrap=True)
+        self.check_label.hide()
+        cl.addWidget(self.check_label)
+        lay.addWidget(c)
         r = QHBoxLayout()
         save = button("Сохранить", "primary")
         save.clicked.connect(self.save_settings)
@@ -1009,12 +1031,8 @@ class MainWindow(QWidget):
                 clips_changed = True
                 if t == "clip" and self.tray and not self.isVisible():
                     self.tray.showMessage(APP_NAME, f"Новый клип: {ev.get('channel')}", T.app_icon(), 4000)
-            elif t == "update":
-                self.update_label.setText(f"Вышла новая версия {ev['version']}")
-                if self.update_url is None:               # проверка идёт дважды в сутки: кнопку подключаем один раз
-                    self.update_btn.clicked.connect(lambda: webbrowser.open(self.update_url or ""))
-                self.update_url = ev["url"]
-                self.update_bar.show()
+            elif t in ("update", "no_update", "update_error", "update_progress", "update_ready", "update_failed"):
+                self.on_update(ev)
         if not self.isVisible():
             return
         self.refresh_streams()
@@ -1043,6 +1061,102 @@ class MainWindow(QWidget):
             lines.append(f"Процессор {self.sup.cpu:.0f}% · память {self.sup.ram:.0f}%")
         self.side_status.setText("\n".join(lines))
 
+    # --- обновление программы -----------------------------------------------
+    def check_updates(self) -> None:
+        self.check_btn.setEnabled(False)
+        self._say_check("Проверяю…")
+        self.sup.check_update_now()
+
+    def _say_check(self, text: str) -> None:
+        self.check_label.setText(text)
+        self.check_label.setVisible(bool(text))
+
+    def on_update(self, ev: dict) -> None:
+        t = ev["t"]
+        if t in ("update", "no_update", "update_error"):          # ответ на «Проверить обновления» или фоновую проверку
+            asked = not self.check_btn.isEnabled()
+            self.check_btn.setEnabled(True)
+            if t == "no_update":
+                self._say_check("У тебя последняя версия.")
+            elif t == "update_error":
+                self._say_check(f"Не получилось проверить: {ev['error']}.")
+            elif asked:
+                self._say_check(f"Вышла новая версия {ev['version']}. Кнопка обновления вверху окна.")
+        if t == "update":
+            new = self.upd.get("version") != ev["version"]
+            if self.upd.get("state") in ("downloading", "installing"):
+                return                                            # обновление уже идёт: полоску не трогаем
+            self.upd = {"version": ev["version"], "url": ev["url"], "state": "found",
+                        "auto": bool(ev.get("auto")) and not self.update_manual}
+            self.update_label.setText(f"Вышла новая версия {ev['version']}")
+            self.update_btn.setText("Обновить" if self.upd["auto"] else "Скачать")
+            self.update_btn.setEnabled(True)
+            self.update_alt.hide()
+            self.update_bar.show()
+            if new and self.tray and not self.isVisible():
+                self.tray.showMessage(APP_NAME, f"Вышла новая версия {ev['version']}. Открой окно программы, "
+                                                "чтобы обновить.", T.app_icon(), 6000)
+            if self.update_unattended and self.upd["auto"]:
+                self.start_update()
+        elif t == "update_progress" and self.upd.get("state") == "downloading":
+            self.update_label.setText(f"Скачиваю обновление {self.upd['version']}: {ev['pct']}%")
+        elif t == "update_failed":
+            self._update_trouble(f"Обновление не скачалось: {ev['error']}.")
+        elif t == "update_ready":
+            try:
+                updater.launch_installer(ev["path"], ev["version"])
+            except Exception as e:
+                self.sup.say(f"Обновление {ev['version']}: {e}", "error")
+                self._update_trouble(f"Обновление не началось: {e}.")
+                return
+            self.upd["state"] = "installing"
+            self.update_label.setText(f"Ставлю версию {ev['version']}. Программа сейчас закроется и откроется сама.")
+            self.sup.say(f"Ставлю версию {ev['version']}: программа закроется и откроется сама")
+            QTimer.singleShot(1200, self.quit_for_update)         # даём прочитать надпись
+
+    def _update_trouble(self, text: str) -> None:
+        self.upd["state"] = "failed"
+        self.update_label.setText(text + " Попробуй ещё раз или скачай установщик вручную.")
+        self.update_btn.setText("Повторить")
+        self.update_btn.setEnabled(True)
+        self.update_alt.show()
+        self.update_bar.show()
+
+    def confirm_update(self) -> bool:
+        box = QMessageBox(self)
+        box.setWindowTitle(APP_NAME)
+        box.setIcon(QMessageBox.Icon.Question)
+        box.setText(f"Обновить программу до версии {self.upd.get('version', '')}?")
+        box.setInformativeText("Программа скачает новую версию, закроется примерно на минуту и откроется сама. "
+                               "Запись стримов на это время прервётся, поэтому лучше обновляться, когда в эфире "
+                               "нет ничего важного. Настройки и клипы останутся на месте.")
+        yes = box.addButton("Обновить", QMessageBox.ButtonRole.AcceptRole)
+        box.addButton("Позже", QMessageBox.ButtonRole.RejectRole)
+        box.exec()
+        return box.clickedButton() is yes
+
+    def update_clicked(self) -> None:
+        if not self.upd:
+            return
+        if not self.upd.get("auto"):
+            webbrowser.open(self.upd.get("url") or updater.PAGE)
+            return
+        if self.upd.get("state") in ("found", "failed") and self.confirm_update():
+            self.start_update()
+
+    def start_update(self) -> None:
+        if not self.sup.download_update():
+            return
+        self.upd["state"] = "downloading"
+        self.update_label.setText(f"Скачиваю обновление {self.upd['version']}: 0%")
+        self.update_btn.setText("Скачиваю…")
+        self.update_btn.setEnabled(False)
+        self.update_alt.hide()
+
+    def quit_for_update(self) -> None:
+        self.for_update = True
+        self.quit()
+
     # --- окно и трей --------------------------------------------------------
     def show_window(self) -> None:
         self.showNormal()
@@ -1061,7 +1175,7 @@ class MainWindow(QWidget):
                                             "значку возле часов.", T.app_icon(), 5000)
             return
         self.timer.stop()
-        self.sup.shutdown()
+        self.sup.shutdown(for_update=self.for_update)
         e.accept()
         QApplication.quit()
 
@@ -1080,6 +1194,15 @@ def main(argv: list[str]) -> int:
     sup = Supervisor()
     sup.start()
     win = MainWindow(sup)
+    outcome, ver = updater.finish_update(argv)            # чем кончилось обновление, начатое в прошлый раз
+    if outcome == "ok":
+        sup.say(f"Программа обновлена до версии {ver}")
+    elif outcome == "failed":
+        win.update_manual = True
+        sup.say(f"Обновление до {ver} не установилось. Скачай установщик вручную: кнопка «Скачать» вверху окна "
+                "появится через полминуты", "error")
+    # Проверка сборки: программа сама находит «новую версию» на этом же компьютере и ставит её без вопроса
+    win.update_unattended = bool(updater.test_api()) and "--updated" not in argv
     if "--minimized" in argv and win.tray:
         pass                                   # автозапуск: сидим в трее и не мешаем
     else:

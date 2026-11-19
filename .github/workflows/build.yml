@@ -119,6 +119,16 @@ jobs:
           name: StreamClipper-Setup
           path: dist/StreamClipper-Setup.exe
 
+      # Кнопка «Обновить»: ставим программу этим установщиком и даём ей обновиться самой (см. packaging/update_smoke.py)
+      - name: Update button (installed program updates itself)
+        shell: pwsh
+        timeout-minutes: 25
+        env:
+          PYTHONUTF8: "1"
+        run: |
+          python packaging/update_smoke.py dist\StreamClipper-Setup.exe
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+
       - uses: actions/upload-artifact@v4
         if: always()
         with:
