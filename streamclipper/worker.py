@@ -22,7 +22,7 @@ import time
 import uuid
 from pathlib import Path
 
-from . import config, mp4stream, segments, util
+from . import config, mp4stream, netmeter, segments, util
 from .chat import ChatClient
 from .detector import WARMUP, Detector, Event
 from .learning import Learner, learnable, tokenize
@@ -38,6 +38,7 @@ STALL = 50            # видео идёт, а новых кусков на д�
 PUMP_HANG = 60        # цикл записи молчит столько секунд = завис (обычно на зависшем ffmpeg)
 LIVE_RESET = 300      # видео не было дольше этого и появилось = стрим начался заново, норму чата учим с нуля
 CHAT_RESET = 120      # чат был недоступен дольше этого = его норму тоже учим заново
+CAP_FORGET = 600      # эфира нет дольше этого = сниженное из-за интернета качество забываем
 
 
 class Worker:
@@ -76,6 +77,17 @@ class Worker:
         self.chat_down_since = 0.0
         self._hang_acted = 0.0
         self._grace_until = 0.0
+        self.net = netmeter.NetMeter()                   # успевает ли интернет за этим стримом
+        self.net_on = False
+        self.slow = False
+        self.variants: list[tuple[int, int, str, int]] = []      # качества стрима: (высота, кадров/с, имя, бит/с)
+        self.auto_cap: tuple[int, int] | None = None     # потолок качества, до которого запись снизила себя сама
+        self._reopen = False                             # стрим переоткрывается в другом качестве, это не конец эфира
+        self._slow_said = 0.0
+        # True: о конце эфира ещё надо сообщить. С самого начала тоже: если запись перезапускалась, а эфир за это
+        # время кончился, окно иначе так и считало бы, что стрим идёт.
+        self.was_online = True
+        self._off_since = 0.0                            # с какого времени Twitch говорит, что эфира нет
 
     def _apply_learning(self) -> None:
         """Подхватывает то, чему программа научилась на оценках: порог и словарь этого канала."""
@@ -138,6 +150,7 @@ class Worker:
         if fake:                                    # для тестов: любая команда, выдающая MPEG-TS
             p = subprocess.Popen(shlex.split(fake), stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
             self.quality, self.title = "тест", "Тестовый стрим"
+            self.net_on = False
             p.read = p.stdout.read                  # type: ignore[attr-defined]
             p.close = p.kill                        # type: ignore[attr-defined]
             return p
@@ -167,10 +180,43 @@ class Worker:
             self.category = plugin.get_category() or ""
         except Exception:
             pass
-        name = pick_quality(list(streams), self.cfg.get("quality", "best"))
-        self.quality = name
+        name = pick_quality(list(streams), self.cfg.get("quality", "best"), self.auto_cap)
+        self.variants = netmeter.rank(streams)
+        if name == "best" and self.variants:             # показываем настоящее качество, а не слово «best»
+            self.quality = self.variants[-1][2]
+        else:
+            self.quality = name
         log.info("качества стрима: %s; беру %s (%s)", ", ".join(streams), name, type(streams[name]).__name__)
-        return streams[name].open()
+        src = streams[name].open()
+        self.net.reset()
+        self.slow = False
+        try:
+            cap = float(os.environ.get("STREAMCLIPPER_NET_CAP_KBPS") or 0)
+        except ValueError:
+            cap = 0.0
+        self.net_on = netmeter.attach(src, self.net, cap)
+        if not self.net_on:
+            log.info("замер скорости интернета к этому стриму не подключился: качество само снижаться не будет")
+        return src
+
+    def _lower_quality(self, load: float, speed: float) -> bool:
+        """Интернет не успевает за стримом: выбирает качество полегче. True: стрим надо переоткрыть."""
+        new = netmeter.lower(self.variants, self.quality, speed)
+        now = time.time()
+        if new is None:
+            if now - self._slow_said > 900:              # ниже некуда: говорим об этом, но изредка
+                self._slow_said = now
+                log.warning("интернет не успевает даже за самым низким качеством %s (кусочки качаются в %.1f раза "
+                            "дольше, чем длятся)", self.quality, load)
+                self.emit(t="event", kind="slow_net", old=self.quality, new="")
+            return False
+        old = self.quality
+        self.auto_cap = new[:2]
+        self._reopen = True
+        log.warning("интернет не успевает за качеством %s: кусочки качаются в %.1f раза дольше, чем длятся, скорость "
+                    "%.1f Мбит/с. Перехожу на %s", old, load, speed / 1e6, new[2])
+        self.emit(t="event", kind="slow_net", old=old, new=new[2])
+        return True
 
     def _start_ffmpeg(self, kind: str = "ts") -> subprocess.Popen:
         self.run_no += 1
@@ -255,6 +301,7 @@ class Worker:
         last = time.time()
         got, report_at, t_open = 0, time.time() + 25, time.time()
         health_at, got_mark, flowing_since = time.time() + 15, 0, time.time()
+        net_at = time.time() + 20
         kind: str | None = None                          # вид потока: Twitch отдаёт либо MPEG-TS, либо fMP4
         boxes: mp4stream.Mp4Boxes | None = None
         ftyp, init = b"", b""
@@ -270,6 +317,12 @@ class Worker:
                     log.info("за %d с получено %.1f МБ видео, на диске %d кусков (%.1f МБ)", now - t_open,
                              got / 1e6, len(segs), sum(os.path.getsize(x.path) for x in segs if os.path.exists(x.path)) / 1e6)
                     report_at = now + (60 if now - t_open < 200 else 900)
+                if self.net_on and now >= net_at:        # успевает ли интернет: если нет, берём качество полегче
+                    net_at = now + 5
+                    load, busy, speed = self.net.read(now)
+                    self.slow = busy >= netmeter.BUSY and load >= netmeter.SLOW
+                    if self.slow and self._lower_quality(load, speed):
+                        break
                 if now >= health_at:                     # видео приходит, а на диск не ложится: так молчать нельзя
                     health_at = now + 15
                     segs = segments.scan(self.buf_dir)
@@ -385,9 +438,17 @@ class Worker:
                 continue
             if src is None:
                 self.state, self.detail = "offline", ""
+                if self.was_online:                      # Twitch подтвердил: эфира больше нет
+                    self.was_online = False
+                    self.emit(t="event", kind="offline")
+                self._off_since = self._off_since or time.time()
+                if self.auto_cap and time.time() - self._off_since > CAP_FORGET:
+                    self.auto_cap = None                 # следующий эфир снова пробуем в качестве из настроек
                 self.stop.wait(40 + random.random() * 20)
                 continue
             self.detail = ""
+            self.was_online = True
+            self._off_since = 0.0
             log.info("стрим в эфире, качество %s", self.quality)
             self.emit(t="event", kind="online", title=self.title, quality=self.quality)
             started = time.time()
@@ -407,6 +468,10 @@ class Worker:
                     src.close()
                 except Exception:
                     pass
+            if self._reopen:                             # сменили качество: сразу открываем стрим заново
+                self._reopen = False
+                self.state = "starting"
+                continue
             if not self.stop.is_set() and self.state != "error":
                 self.state = "offline"
                 # пауза и сбой записи: это не конец стрима, уведомление «стрим закончился» не нужно
@@ -577,7 +642,7 @@ class Worker:
             if n % 2 == 0:
                 self.emit(t="status", state=self.state, detail=self.detail, rate=round(rate, 1),
                           level=round(level, 2), hot=hot, buf_mb=round(self.buf_bytes / 1e6),
-                          chat=self.chat.connected, title=self.title, quality=self.quality)
+                          chat=self.chat.connected, title=self.title, quality=self.quality, slow=self.slow)
         self.chat.stop()
         time.sleep(0.3)
         return 0
@@ -593,18 +658,19 @@ def recorder_cmd(buf_dir: Path, run: int, kind: str = "ts") -> list[str]:
             "-segment_list", listing, "-segment_list_type", "csv", "-reset_timestamps", "0", pattern]
 
 
-def pick_quality(names: list[str], want: str) -> str:
-    """best = как у стримера. Число = не выше этой высоты кадра (экономит диск и интернет)."""
+def pick_quality(names: list[str], want: str, cap: tuple[int, int] | None = None) -> str:
+    """best = как у стримера. Число = не выше этой высоты кадра (экономит диск и интернет).
+    cap: (высота, кадров/с), выше которых брать нельзя: до него запись снизила себя сама, когда не успевал интернет."""
     want = str(want or "best").lower().rstrip("p")
-    if not want.isdigit():
+    if not want.isdigit() and cap is None:
         return "best" if "best" in names else names[-1]
-    limit = int(want)
+    limit = int(want) if want.isdigit() else None
     ranked = []
     for n in names:
         m = re.fullmatch(r"(\d+)p(\d+)?", n)
         if m:
             ranked.append((int(m.group(1)), int(m.group(2) or 30), n))
-    ok = [r for r in ranked if r[0] <= limit]
+    ok = [r for r in ranked if (limit is None or r[0] <= limit) and (cap is None or r[:2] <= cap)]
     if ok:
         return max(ok)[2]
     if ranked:

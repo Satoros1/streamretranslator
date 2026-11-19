@@ -10,6 +10,9 @@ on:
       channels:
         description: Каналы через пробел (пусто = самые популярные русские прямо сейчас)
         default: ""
+      net_cap_kbps:
+        description: Изобразить медленный интернет, кбит/с на стрим (пусто = без ограничения). Например 2500
+        default: ""
   push:
     branches: [live-check]
 
@@ -52,6 +55,7 @@ jobs:
         env:
           PYTHONUTF8: "1"
           STREAMCLIPPER_DUMP: "1"
+          STREAMCLIPPER_NET_CAP_KBPS: ${{ github.event.inputs.net_cap_kbps }}
           SMOKE_OUT: smoke_clips
         run: |
           $sec = "${{ github.event.inputs.seconds }}"
