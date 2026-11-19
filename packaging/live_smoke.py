@@ -85,8 +85,22 @@ def main() -> int:
     print("channels:", channels)
     env = dict(os.environ, STREAMCLIPPER_HOME=home, PYTHONIOENCODING="utf-8", PYTHONUTF8="1")
     cmd = exe.split() + ["headless", seconds] + channels
-    r = subprocess.run(cmd, env=env, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, timeout=int(seconds) + 900)
-    print(r.stdout.decode("utf-8", "replace")[-12000:])
+    out_path = os.path.join(home, "headless.out")
+    stuck = False
+    with open(out_path, "wb") as out_f:                     # в файл, а не в память: вывод нужен, даже если программа зависла
+        proc = subprocess.Popen(cmd, env=env, stdout=out_f, stderr=subprocess.STDOUT)
+        try:
+            proc.wait(int(seconds) + 900)
+        except subprocess.TimeoutExpired:
+            stuck = True
+            if sys.platform == "win32":                     # вместе со всеми процессами записи и монтажа
+                subprocess.run(["taskkill", "/F", "/T", "/PID", str(proc.pid)], stdout=subprocess.DEVNULL,
+                               stderr=subprocess.DEVNULL)
+            proc.kill()
+            proc.wait(30)
+    with open(out_path, "rb") as f:
+        text = f.read().decode("utf-8", "replace")
+    print(text[-12000:])
     for log in glob.glob(os.path.join(home, "logs", "*.log")):
         print("=====", os.path.basename(log))
         with open(log, encoding="utf-8", errors="replace") as f:
@@ -116,12 +130,25 @@ def main() -> int:
         for i, p in enumerate(tall[:3]):                    # кадры из вертикальных клипов: посмотреть чат на настоящем стриме
             subprocess.run(["ffmpeg", "-hide_banner", "-loglevel", "error", "-y", "-ss", "20", "-i", p, "-frames:v", "1",
                             "-vf", "scale=540:-2", os.path.join(out, "live_vertical_%d.jpg" % i)])
+    # Хронология монтажа: успевает ли он за моментами. Печатается в конце, чтобы попасть в хвост лога.
+    marks = ("пойман момент", "клип готов", "пропущен", "не удался", "не получился", "Запущено")
+    caught = [ln for ln in text.splitlines() if "INFO supervisor" in ln and any(m in ln for m in marks)]
+    print("TIMELINE (%d lines):" % len(caught))
+    for ln in caught[:70]:
+        print("  " + ln[11:19] + " " + ln.split("supervisor: ", 1)[-1][:110])
+    left = re.search(r"UNFINISHED EDITS: (\d+)", text)
+    print("moments caught: %d, clips made: %d, dropped as weakest: %d, left unedited: %s" % (
+        sum("пойман момент" in ln for ln in caught), sum("клип готов" in ln for ln in caught),
+        sum("Монтаж не успевает" in ln for ln in caught), left.group(1) if left else "0"))
+    if stuck:
+        print("HEADLESS DID NOT FINISH: killed after %d s" % (int(seconds) + 900))
     made = sorted({os.path.basename(os.path.dirname(os.path.dirname(p))) for p in found})
     missing = [c for c in channels if c.lower() not in made]
     print("channels with clips: %d of %d" % (len(made), len(channels)), "| without:", missing or "none")
     lossy = lost_video(home) + jumpy_clips(found)
     print("video lost on the way to disk or inside clips:", lossy or "none")
-    good = bool(found) and len(missing) <= 1 and not lossy   # один канал мог как раз уйти на рекламу или закончить стрим
+    # один канал мог как раз уйти на рекламу или закончить стрим
+    good = bool(found) and len(missing) <= 1 and not lossy and not stuck
     print("LIVE SMOKE:", "PASSED, clips: %d" % len(found) if good else "FAILED, clips: %d" % len(found))
     return 0 if good else 1
 
