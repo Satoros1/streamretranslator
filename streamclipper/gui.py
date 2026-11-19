@@ -1141,7 +1141,8 @@ class MainWindow(QWidget):
         if not self.upd.get("auto"):
             webbrowser.open(self.upd.get("url") or updater.PAGE)
             return
-        if self.upd.get("state") in ("found", "failed") and self.confirm_update():
+        state = self.upd.get("state")
+        if state == "failed" or (state == "found" and self.confirm_update()):      # «Повторить» второй раз не спрашивает
             self.start_update()
 
     def start_update(self) -> None:
