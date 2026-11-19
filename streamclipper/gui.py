@@ -15,7 +15,7 @@ from PySide6.QtWidgets import (QApplication, QCheckBox, QComboBox, QFileDialog, 
                                QScrollArea, QSlider, QSpinBox, QStackedWidget, QSystemTrayIcon, QToolButton,
                                QVBoxLayout, QWidget)
 
-from . import APP_NAME, __version__, config, system, util
+from . import APP_NAME, __version__, bible, config, system, util
 from .supervisor import Supervisor
 from .uploader import TG_KEYS, pick_channel, summarize_test
 from .ui import theme as T
@@ -272,7 +272,8 @@ class MainWindow(QWidget):
         body.addWidget(self._sidebar())
         self.stack = QStackedWidget()
         body.addWidget(self.stack, 1)
-        for build in (self._page_streams, self._page_clips, self._page_telegram, self._page_log, self._page_settings):
+        for build in (self._page_streams, self._page_clips, self._page_learn, self._page_telegram, self._page_log,
+                      self._page_settings):
             self.stack.addWidget(build())
         self.go(0)
 
@@ -316,8 +317,8 @@ class MainWindow(QWidget):
         lay.addLayout(brand)
         lay.addSpacing(22)
         self.nav: list[QPushButton] = []
-        for i, (text, ic) in enumerate((("Стримы", "streams"), ("Клипы", "clips"), ("Telegram", "send"),
-                                        ("Журнал", "log"), ("Настройки", "settings"))):
+        for i, (text, ic) in enumerate((("Стримы", "streams"), ("Клипы", "clips"), ("Обучение", "learn"),
+                                        ("Telegram", "send"), ("Журнал", "log"), ("Настройки", "settings"))):
             b = QPushButton("  " + text)
             b.setObjectName("nav")
             b.setCheckable(True)
@@ -340,6 +341,8 @@ class MainWindow(QWidget):
             b.setChecked(n == i)
         if i == 1:
             self.refresh_clips()
+        if i == self.PAGE_LEARN:
+            self.refresh_learn()
 
     # --- страница «Стримы» ------------------------------------------------
     def _page_streams(self) -> QWidget:
@@ -767,6 +770,55 @@ class MainWindow(QWidget):
 
         self.bridge.run(self.sup.tg.list_channels, done)
 
+    # --- страница «Обучение» -------------------------------------------------
+    PAGE_LEARN = 2
+
+    def _page_learn(self) -> QWidget:
+        area, lay = page("Обучение", "Как программа выбирает моменты и чему она научилась на твоих оценках. "
+                                     "Страница пишется сама: после каждой оценки сюда добавляется вывод.")
+        self.learn_box = QVBoxLayout()
+        self.learn_box.setSpacing(16)
+        lay.addLayout(self.learn_box)
+        b = button("Открыть текстовым файлом", "link")
+        b.setToolTip("Тот же текст одним файлом: его можно переслать или сохранить.")
+        b.clicked.connect(self.open_bible)
+        lay.addWidget(b, 0, Qt.AlignmentFlag.AlignLeft)
+        lay.addStretch(1)
+        self._learn_shown: list | None = None
+        self._learn_at = 0.0
+        return area
+
+    def _bible(self) -> list[tuple[str, list[str]]]:
+        return bible.build(self.sup.learner, self.sup.cfg, {s["name"]: s for s in self.sup.snapshot()})
+
+    def refresh_learn(self) -> None:
+        self._learn_at = time.time()
+        try:
+            sections = self._bible()
+        except Exception as e:
+            self.sup.say(f"Страница «Обучение» не собралась: {e}", "error")
+            return
+        if sections == self._learn_shown:
+            return
+        self._learn_shown = sections
+        clear(self.learn_box)
+        for title, lines in sections:
+            f, cl = card()
+            cl.addWidget(label(title, "h2"))
+            for ln in lines:
+                cl.addWidget(label("•  " + ln, "muted", wrap=True))
+            self.learn_box.addWidget(f)
+
+    def open_bible(self) -> None:
+        try:
+            path = str(bible.save(self._bible()))
+            if sys.platform == "win32":
+                os.startfile(path)  # type: ignore[attr-defined]
+            else:
+                webbrowser.open("file://" + path)
+        except Exception as e:
+            self.sup.say(f"Файл «{bible.FILE}» не открылся: {e}", "error")
+
     # --- страница «Журнал» ------------------------------------------------
     def _page_log(self) -> QWidget:
         w = QWidget()
@@ -961,6 +1013,8 @@ class MainWindow(QWidget):
         self.refresh_streams()
         if clips_changed and self.stack.currentIndex() == 1:
             self.refresh_clips()
+        if self.stack.currentIndex() == self.PAGE_LEARN and time.time() - self._learn_at > 5:
+            self.refresh_learn()
         tg = self.sup.tg
         q = tg.queue.counts(1.5).get("pending", 0) if self.sup.cfg.get("tg_enabled") else 0
         self.tg_chip.setText(tg.status_text + (f" · в очереди {q}" if q else ""))

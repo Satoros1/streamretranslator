@@ -650,9 +650,12 @@ class Worker:
                 keep = max(4, float(self.cfg.get("buffer_minutes", 6))) * 60
                 self.buf_bytes = segments.prune(self.buf_dir, keep, now)
             if n % 2 == 0:
+                with self.det_lock:                      # для страницы «Обучение»: планка чата и что отсеяно
+                    bar, skips = self.det.rare_bar(now), dict(self.det.skipped)
                 self.emit(t="status", state=self.state, detail=self.detail, rate=round(rate, 1),
                           level=round(level, 2), hot=hot, buf_mb=round(self.buf_bytes / 1e6),
-                          chat=self.chat.connected, title=self.title, quality=self.quality, slow=self.slow)
+                          chat=self.chat.connected, title=self.title, quality=self.quality, slow=self.slow,
+                          bar=round(bar, 1) if bar else 0, skips=skips)
         self.chat.stop()
         time.sleep(0.3)
         return 0

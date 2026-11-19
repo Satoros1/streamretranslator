@@ -492,7 +492,7 @@ class Supervisor:
                 out.append({"name": h.name, "state": state, "text": text, "slow": slow, "rate": s.get("rate", 0),
                             "level": s.get("level", 0), "buf_mb": s.get("buf_mb", 0), "clips": h.clips,
                             "quality": s.get("quality", ""), "title": s.get("title", ""),
-                            "chat": s.get("chat", False)})
+                            "chat": s.get("chat", False), "bar": s.get("bar", 0), "skips": s.get("skips") or {}})
         return out
 
     # --- монтаж -----------------------------------------------------------
