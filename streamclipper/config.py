@@ -37,6 +37,8 @@ def default_clips_dir() -> str:
     return str(Path.home() / "Videos" / APP_NAME)
 
 
+LOOK = 3                                      # номер вида клипа по умолчанию, см. load
+
 DEFAULTS: dict = {
     "channels": [],
     "paused": False,
@@ -58,7 +60,7 @@ DEFAULTS: dict = {
     "clips_per_hour": 12,       # не больше стольких автоматических клипов в час со всех стримов; 0 = без предела
     "clip_format": "tiktok",    # tiktok: вертикальный 1080x1920; original: как на стриме; both: оба файла
     "tt_layout": "blur",        # blur: стрим целиком, фон размыт; big: крупно, края по бокам обрезаются; crop: на весь экран
-    "tt_title": True,           # крупная надпись над видео
+    "tt_title": False,          # крупная надпись над видео; по умолчанию клип выходит без неё
     "tt_title_text": "",        # своя надпись на каждый клип; пусто = программа придумывает сама
     "look": 0,                  # какой вид клипа уже предложен этому компьютеру (см. load)
     "chat_style": "soft",       # чат в вертикальном клипе: off, text, soft, solid
@@ -115,13 +117,19 @@ def load() -> dict:
             pass
     if not cfg["clips_dir"]:
         cfg["clips_dir"] = default_clips_dir()
-    if int(cfg.get("look") or 0) < 2:
+    look = int(cfg.get("look") or 0)
+    if look < 2:
         # Основной вид: стрим целиком. Вид «крупно» был основным в 0.1.2 и 0.1.3 и срезал края стрима: пропадала
         # половина вебки и чат стримера. У кого он стоял, тот один раз получает «целиком»; после этого выбор
         # в настройках больше не трогаем.
         if cfg.get("tt_layout") == "big":
             cfg["tt_layout"] = "blur"
-        cfg["look"] = 2
+    if look < 3:
+        # Надпись над видео («Чат в шоке») была включена у всех с 0.1.2, без неё клип смотрится лучше. Один раз
+        # выключаем; свой текст заголовка человек вписывал сам, с ним надпись остаётся.
+        if not str(cfg.get("tt_title_text") or "").strip():
+            cfg["tt_title"] = False
+    cfg["look"] = LOOK
     return cfg
 
 
