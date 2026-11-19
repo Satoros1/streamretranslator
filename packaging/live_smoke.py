@@ -7,6 +7,7 @@
 import glob
 import json
 import os
+import re
 import subprocess
 import sys
 import tempfile
@@ -37,6 +38,39 @@ def live_ru(n: int = 4) -> list[str]:
         except Exception as e:
             print("GQL lookup failed:", e, str(locals().get("d"))[:300])
     return []
+
+
+def lost_video(home: str) -> list[str]:
+    """Всё ли полученное видео легло на диск. Сверяем по отчётам записи, пока буфер ещё ничего не удалял."""
+    bad = []
+    pat = re.compile(r"за (\d+) с получено ([\d.]+) МБ видео, на диске (\d+) кусков \(([\d.]+) МБ\)")
+    for log in sorted(glob.glob(os.path.join(home, "logs", "worker_*.log"))):
+        name = os.path.basename(log)[7:-4]
+        with open(log, encoding="utf-8", errors="replace") as f:
+            rows = [(int(m[1]), float(m[2]), float(m[4])) for m in pat.finditer(f.read()) if int(m[1]) <= 215]
+        if not rows:
+            continue
+        sec, got, disk = rows[-1]
+        print("RECORDED %s: %.1f of %.1f MB in %d s (%d%%)" % (name, disk, got, sec, round(100 * disk / max(got, 0.1))))
+        if got > 10 and disk < 0.85 * got:
+            bad.append("%s: on disk only %d%%" % (name, round(100 * disk / got)))
+    return bad
+
+
+def jumpy_clips(found: list[str]) -> list[str]:
+    """Клип обязан быть одним цельным куском: между соседними кадрами не должно быть дыр."""
+    bad = []
+    for p in found:
+        if p.endswith("_9x16.mp4"):
+            continue                                        # вертикальный перекодирован, дыру в нём не увидеть; смотрим исходный
+        r = subprocess.run(["ffprobe", "-v", "error", "-select_streams", "v:0", "-show_entries", "packet=pts_time",
+                            "-of", "csv=p=0", p], stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
+        pts = sorted(float(x) for x in r.stdout.decode("ascii", "replace").replace(",", " ").split() if x[:1].isdigit())
+        gap = max((b - a for a, b in zip(pts, pts[1:])), default=0.0)
+        print("CONTINUITY %s: %d frames, biggest gap %.3f s" % (os.path.basename(p), len(pts), gap))
+        if len(pts) < 100 or gap > 0.5:
+            bad.append("%s: gap %.1f s" % (os.path.basename(p), gap))
+    return bad
 
 
 def main() -> int:
@@ -85,7 +119,9 @@ def main() -> int:
     made = sorted({os.path.basename(os.path.dirname(os.path.dirname(p))) for p in found})
     missing = [c for c in channels if c.lower() not in made]
     print("channels with clips: %d of %d" % (len(made), len(channels)), "| without:", missing or "none")
-    good = bool(found) and len(missing) <= 1               # один канал мог как раз уйти на рекламу или закончить стрим
+    lossy = lost_video(home) + jumpy_clips(found)
+    print("video lost on the way to disk or inside clips:", lossy or "none")
+    good = bool(found) and len(missing) <= 1 and not lossy   # один канал мог как раз уйти на рекламу или закончить стрим
     print("LIVE SMOKE:", "PASSED, clips: %d" % len(found) if good else "FAILED, clips: %d" % len(found))
     return 0 if good else 1
 

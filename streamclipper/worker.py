@@ -161,14 +161,9 @@ class Worker:
 
     def _start_ffmpeg(self, kind: str = "ts") -> subprocess.Popen:
         self.run_no += 1
-        fmt = {"ts": ["-f", "mpegts"], "mp4": ["-f", "mov"]}.get(kind, [])       # неизвестный вид ffmpeg определит сам
-        cmd = [util.find_tool("ffmpeg"), "-hide_banner", "-loglevel", "error", "-fflags", "+genpts+discardcorrupt",
-               *fmt, "-i", "pipe:0", "-map", "0:v:0?", "-map", "0:a:0?", "-c", "copy",
-               "-f", "segment", "-segment_time", str(segments.SEG_TIME), "-segment_format", "mpegts",
-               "-strftime", "1", "-reset_timestamps", "0", segments.seg_pattern(self.buf_dir, self.run_no)]
         err = tempfile.TemporaryFile()
-        ff = subprocess.Popen(cmd, stdin=subprocess.PIPE, stdout=subprocess.DEVNULL, stderr=err,
-                              creationflags=util.NO_WINDOW)
+        ff = subprocess.Popen(recorder_cmd(self.buf_dir, self.run_no, kind), stdin=subprocess.PIPE,
+                              stdout=subprocess.DEVNULL, stderr=err, creationflags=util.NO_WINDOW)
         ff.err = err                                    # type: ignore[attr-defined]
         return ff
 
@@ -363,17 +358,18 @@ class Worker:
             if ev is None:
                 length = float(self.cfg.get("manual_len", 45))
                 want_start, want_end, anchor = now - length - 6, now, now - 8
-                time.sleep(segments.SEG_TIME + 1)          # даём дописаться последнему кусочку
+                deadline = now + 14
             else:
                 want_start = ev.onset - PRE_ROLL
                 want_end = min(ev.end + POST_ROLL, want_start + MAX_RAW)
                 anchor = ev.peak
-                deadline = time.time() + 20                # ждём, пока хвост окажется на диске
-                while time.time() < deadline and not self.stop.is_set():
-                    segs = segments.scan(self.buf_dir)
-                    if segs and segs[-1].start >= want_end:
-                        break
-                    time.sleep(1)
+                deadline = now + 20
+            # ждём, пока хвост окажется на диске; если стрим сейчас не идёт (реклама, пауза), ждать нечего
+            while time.time() < deadline and not self.stop.is_set() and self.state == "live":
+                segs = segments.scan(self.buf_dir)
+                if segs and segs[-1].start >= want_end:
+                    break
+                time.sleep(1)
             segs, start, end = segments.select(segments.scan(self.buf_dir), want_start, want_end, anchor)
             if not segs:
                 log.info("для события нет видео в буфере (реклама или стрим не шёл)")
@@ -479,6 +475,16 @@ class Worker:
         self.chat.stop()
         time.sleep(0.3)
         return 0
+
+
+def recorder_cmd(buf_dir: Path, run: int, kind: str = "ts") -> list[str]:
+    """Команда ffmpeg, которая без перекодирования режет поток из stdin на кусочки буфера."""
+    fmt = {"ts": ["-f", "mpegts"], "mp4": ["-f", "mov"]}.get(kind, [])           # неизвестный вид ffmpeg определит сам
+    pattern, listing = segments.run_files(buf_dir, run)
+    return [util.find_tool("ffmpeg"), "-hide_banner", "-loglevel", "error", "-fflags", "+genpts+discardcorrupt",
+            *fmt, "-i", "pipe:0", "-map", "0:v:0?", "-map", "0:a:0?", "-c", "copy",
+            "-f", "segment", "-segment_time", str(segments.SEG_TIME), "-segment_format", "mpegts",
+            "-segment_list", listing, "-segment_list_type", "csv", "-reset_timestamps", "0", pattern]
 
 
 def pick_quality(names: list[str], want: str) -> str:
