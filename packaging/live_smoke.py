@@ -141,6 +141,15 @@ def main() -> int:
     print("moments caught: %d, clips made: %d, dropped as weakest: %d, left unedited: %s" % (
         sum("пойман момент" in ln for ln in caught), sum("клип готов" in ln for ln in caught),
         sum("Монтаж не успевает" in ln for ln in caught), left.group(1) if left else "0"))
+    # Отбор: сколько всплесков чата программа сочла слишком слабыми для клипа и почему.
+    weak: dict[str, int] = {}
+    for log in glob.glob(os.path.join(home, "logs", "*.log*")):
+        with open(log, encoding="utf-8", errors="replace") as f:
+            for ln in f:
+                if "не стал клипом: " in ln:
+                    why = ln.split("не стал клипом: ", 1)[1].split(" (")[0].strip()
+                    weak[why] = weak.get(why, 0) + 1
+    print("chat bursts rejected as too weak: %d %s" % (sum(weak.values()), weak or ""))
     # Проверка с зажатой скоростью: программа обязана сама заметить медленный интернет и снизить качество.
     cap = os.environ.get("STREAMCLIPPER_NET_CAP_KBPS") or ""
     lowered = sorted({ln.split("supervisor: ", 1)[-1].split(":")[0] for ln in caught if "дальше записываю в" in ln})

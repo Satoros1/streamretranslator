@@ -58,15 +58,56 @@ def transcribe(raw: str, start: float, end: float, cfg: dict) -> list[tuple[floa
         return []
 
 
-SYSTEM = """Ты редактор нарезок с русскоязычных Twitch-стримов. Тебе дают кусок стрима в виде текста: \
-что говорил стример (расшифровка может быть с ошибками) и что писал чат, с секундами от начала куска.
+SYSTEM = """Ты редактор нарезок с русскоязычных Twitch-стримов для TikTok. Тебе дают кусок стрима: что говорил \
+стример (расшифровка может быть с ошибками) и что писал чат, с секундами от начала куска. Иногда к этому \
+приложены кадры из того же куска, у каждого подписана его секунда.
 Чат отреагировал на что-то смешное или неожиданное. Твоя задача:
 1. Понять, что произошло, и выбрать ОДИН непрерывный отрезок без склеек, который затягивает: \
 короткая подводка, сам момент, реакция. Скучное начало и затянутый хвост отрежь.
-2. Придумать короткий цепляющий заголовок (до 60 символов) и описание в одно-два предложения, по-русски, \
-живым языком, без пересказа очевидного и без выдумок: только то, что видно из текста.
-3. Оценить, насколько это смешно/залипательно для зрителя нарезок, от 0 до 100.
-Если это не момент, а просто спам, реклама, бот или ничего не понятно, поставь keep=false."""
+2. Придумать заголовок. Он будет написан крупно над видео, как в TikTok-нарезках, и должен коротко называть \
+то, что происходит на экране, чтобы зритель захотел досмотреть. Примеры: «угон инвалидной коляски в гта 6», \
+«стример проиграл всё за 10 секунд». До 45 символов, по-русски, без кавычек, эмодзи, хэштегов и точки в конце.
+3. Написать описание в одно-два предложения, по-русски, живым языком, без пересказа очевидного.
+4. Оценить, насколько это смешно/залипательно для зрителя нарезок, от 0 до 100.
+Не выдумывай: пиши только то, что видно из текста и кадров. Если это не момент, а просто спам, реклама, бот \
+или ничего не понятно, поставь keep=false."""
+
+SHOTS = 8             # сколько кадров показать ИИ
+SHOT_W = 640          # ширина кадра: хватает, чтобы понять происходящее, и почти ничего не стоит
+
+
+def shots(raw: str, start: float, end: float, n: int = SHOTS) -> list[tuple[float, bytes]]:
+    """Кадры из куска [start, end] через равные промежутки: [(секунда, JPEG)]. Нужны, чтобы ИИ видел экран."""
+    out: list[tuple[float, bytes]] = []
+    if end - start < 2 or n < 1:
+        return out
+    step = (end - start) / n
+    for i in range(n):
+        t = start + step * (i + 0.5)
+        try:
+            r = util.run([util.find_tool("ffmpeg"), "-hide_banner", "-loglevel", "error", "-ss", f"{t:.2f}", "-i", raw,
+                          "-frames:v", "1", "-vf", f"scale={SHOT_W}:-2", "-q:v", "6", "-f", "image2pipe",
+                          "-c:v", "mjpeg", "pipe:1"], timeout=30)
+        except Exception as e:
+            log.info("кадр для ИИ не получился: %s", e)
+            break
+        if r.returncode == 0 and r.stdout[:2] == b"\xff\xd8" and len(r.stdout) > 1500:
+            out.append((t, r.stdout))
+    return out
+
+
+def ai_content(user: str, pics: list[tuple[float, bytes]]):
+    """Сообщение для модели: кадры с подписями секунд, за ними текст. Без кадров: просто текст."""
+    if not pics:
+        return user
+    import base64
+    content: list[dict] = []
+    for t, jpg in pics:
+        content.append({"type": "text", "text": f"Кадр на {t:.0f}-й секунде:"})
+        content.append({"type": "image", "source": {"type": "base64", "media_type": "image/jpeg",
+                                                    "data": base64.standard_b64encode(jpg).decode("ascii")}})
+    content.append({"type": "text", "text": user})
+    return content
 
 
 def ai_verdict(job: dict, transcript, lo: float, hi: float, cur: tuple[float, float], cfg: dict) -> dict | None:
@@ -85,19 +126,22 @@ def ai_verdict(job: dict, transcript, lo: float, hi: float, cur: tuple[float, fl
             description: str
             score: int
 
+        manual = job.get("kind") == "manual"
         said = "\n".join(f"[{a:.0f}-{b:.0f}] {t}" for a, b, t in transcript) or "(речь не распознана)"
         chat = [c for c in job.get("chat", []) if lo - 5 <= c[0] <= hi + 5]
         step = max(1, len(chat) // 150)                       # не больше ~150 сообщений
         chat_txt = "\n".join(f"[{c[0]:.0f}] {c[1]}: {c[2][:120]}" for c in chat[::step])
-        user = (
-            f"Канал: {job['channel']}\nНазвание стрима: {job.get('title') or '?'}\n"
-            f"Категория: {job.get('category') or '?'}\n"
-            f"Чат начал реагировать на {job['onset']:.0f}-й секунде, пик на {job['peak']:.0f}-й, "
-            f"утих на {job['end']:.0f}-й.\n"
-            f"Можно выбрать отрезок в пределах от {lo:.0f} до {hi:.0f} секунды, длиной от "
-            f"{cfg['clip_min']} до {cfg['clip_max']} секунд. Предварительный выбор: {cur[0]:.0f}-{cur[1]:.0f}.\n\n"
-            f"СТРИМЕР ГОВОРИЛ:\n{said}\n\nЧАТ ПИСАЛ:\n{chat_txt}"
-        )
+        user = (f"Канал: {job['channel']}\nНазвание стрима: {job.get('title') or '?'}\n"
+                f"Категория: {job.get('category') or '?'}\n")
+        if manual:
+            user += (f"Этот отрезок владелец вырезал сам, кнопкой: от {cur[0]:.0f} до {cur[1]:.0f} секунды. Границы "
+                     f"менять нельзя: верни их как есть, keep=true. Нужны заголовок, описание и оценка.\n\n")
+        else:
+            user += (f"Чат начал реагировать на {job['onset']:.0f}-й секунде, пик на {job['peak']:.0f}-й, "
+                     f"утих на {job['end']:.0f}-й.\n"
+                     f"Можно выбрать отрезок в пределах от {lo:.0f} до {hi:.0f} секунды, длиной от "
+                     f"{cfg['clip_min']} до {cfg['clip_max']} секунд. Предварительный выбор: {cur[0]:.0f}-{cur[1]:.0f}.\n\n")
+        user += f"СТРИМЕР ГОВОРИЛ:\n{said}\n\nЧАТ ПИСАЛ:\n{chat_txt or '(пусто)'}"
         try:
             from .learning import Learner
             liked, disliked = Learner().examples(job["channel"])
@@ -107,7 +151,10 @@ def ai_verdict(job: dict, transcript, lo: float, hi: float, cur: tuple[float, fl
                          + ("\nНе понравилось:\n- " + "\n- ".join(disliked) if disliked else ""))
         except Exception:
             pass
-        client = anthropic.Anthropic(api_key=cfg["ai_api_key"], timeout=60.0, max_retries=2)
+        pics = shots(job["raw"], cur[0], cur[1]) if cfg.get("ai_frames", True) and job.get("raw") else []
+        if pics:
+            log.info("ИИ получит кадров: %d", len(pics))
+        client = anthropic.Anthropic(api_key=cfg["ai_api_key"], timeout=90.0, max_retries=2)
         # У модели размышление включено всегда и расходует тот же лимит, что и ответ. С лимитом в 2000 ответ
         # иногда обрывался на полуслове, и описание молча заменялось обычным. Даём запас; платим только за
         # реально написанное. Задача простая, поэтому усилие «low»: быстрее и дешевле.
@@ -115,7 +162,7 @@ def ai_verdict(job: dict, transcript, lo: float, hi: float, cur: tuple[float, fl
             model=cfg.get("ai_model") or "claude-haiku-5-5",
             max_tokens=8000,
             system=SYSTEM,
-            messages=[{"role": "user", "content": user}],
+            messages=[{"role": "user", "content": ai_content(user, pics)}],
             output_config={"effort": "low"},
             output_format=Verdict,
         )
@@ -128,6 +175,22 @@ def ai_verdict(job: dict, transcript, lo: float, hi: float, cur: tuple[float, fl
     except Exception as e:
         log.warning("ИИ-описание не получилось: %s", e)
         return None
+
+
+def headline(job: dict, title: str, from_ai: bool, cfg: dict) -> str:
+    """Надпись над видео в вертикальном клипе. Пустая строка: без надписи.
+
+    Свой текст из настроек важнее всего. Дальше заголовок от ИИ (он знает, что на экране). Без ИИ надпись
+    простая, по реакции чата; у клипа, вырезанного кнопкой, реакции нет, поэтому и надписи нет.
+    """
+    if not cfg.get("tt_title", True):
+        return ""
+    own = str(cfg.get("tt_title_text") or "").strip()
+    if own:
+        return own[:90]
+    if from_ai:
+        return title.strip()
+    return "" if job.get("kind") == "manual" else title.strip()
 
 
 def heuristic(job: dict, transcript) -> tuple[str, str]:

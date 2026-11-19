@@ -39,6 +39,7 @@ PUMP_HANG = 60        # цикл записи молчит столько сек
 LIVE_RESET = 300      # видео не было дольше этого и появилось = стрим начался заново, норму чата учим с нуля
 CHAT_RESET = 120      # чат был недоступен дольше этого = его норму тоже учим заново
 CAP_FORGET = 600      # эфира нет дольше этого = сниженное из-за интернета качество забываем
+LATE_VIDEO = 75       # столько секунд ждём видео момента, если запись отстаёт от эфира
 
 
 class Worker:
@@ -489,21 +490,27 @@ class Worker:
             if ev is None:
                 length = float(self.cfg.get("manual_len", 45))
                 want_start, want_end, anchor = now - length - 6, now, now - 8
-                deadline = now + 14
+                deadline, must, slack = now + 14, 0.0, 15.0
             else:
                 want_start = ev.onset - PRE_ROLL
                 want_end = min(ev.end + POST_ROLL, want_start + MAX_RAW)
                 anchor = ev.peak
-                deadline = now + 20
-            # ждём, пока хвост окажется на диске; если стрим сейчас не идёт (реклама, пауза), ждать нечего
-            while time.time() < deadline and not self.stop.is_set() and self.state == "live":
+                # must: до какого времени видео обязано быть на диске, иначе в клипе не будет самого момента
+                deadline, must, slack = now + 20, min(want_end, ev.end + 2), 2.0
+            # Ждём, пока хвост окажется на диске; если стрим сейчас не идёт (реклама, пауза), ждать нечего.
+            # Когда запись отстаёт от эфира (не хватает интернета), видео момента приходит позже: ждём его
+            # дольше, но не вечно.
+            while not self.stop.is_set() and self.state == "live":
                 segs = segments.scan(self.buf_dir)
                 if segs and segs[-1].start >= want_end:
                     break
+                t = time.time()
+                if t >= deadline and (not must or t >= now + LATE_VIDEO or (segs and segs[-1].end >= must)):
+                    break
                 time.sleep(1)
-            segs, start, end = segments.select(segments.scan(self.buf_dir), want_start, want_end, anchor)
+            segs, start, end = segments.select(segments.scan(self.buf_dir), want_start, want_end, anchor, slack)
             if not segs:
-                log.info("для события нет видео в буфере (реклама или стрим не шёл)")
+                log.info("для события нет видео в буфере (реклама, дыра в записи или стрим не шёл)")
                 if ev is None:
                     self.emit(t="event", kind="no_video")
                 return
@@ -634,6 +641,9 @@ class Worker:
             with self.det_lock:
                 ev = self.det.tick(now)
                 rate, level, hot = self.det.rate, self.det.level, self.det.hype is not None
+                skip, self.det.last_skip = self.det.last_skip, ""
+            if skip:
+                log.info("всплеск в чате не стал клипом: %s", skip)
             if ev:
                 threading.Thread(target=self._make_candidate, args=(ev,), daemon=True).start()
             if n % 5 == 0:

@@ -82,6 +82,11 @@ def choose_window(job: dict, cfg: dict) -> tuple[float, float]:
     return start, end
 
 
+def min_length(cfg: dict, manual: bool) -> float:
+    """Короче этого клип не сохраняется. Клип по кнопке человек попросил сам, с ним строгость ни к чему."""
+    return 8.0 if manual else max(12.0, 0.6 * float(cfg["clip_min"]))
+
+
 def cut(raw: str, start: float, dur: float, out: str) -> bool:
     """Клип как на стриме: без перекодирования."""
     cmd = [util.find_tool("ffmpeg"), "-hide_banner", "-loglevel", "error", "-y", "-ss", f"{start:.3f}", "-i", raw,
@@ -93,15 +98,16 @@ def cut(raw: str, start: float, dur: float, out: str) -> bool:
     return r.returncode == 0 and os.path.exists(out) and os.path.getsize(out) > 50_000
 
 
-def cut_vertical(raw: str, start: float, dur: float, out: str, job: dict, cfg: dict) -> bool:
-    """Вертикальный клип 1080x1920. Чат рисуется в отдельном процессе: если с ним что-то не так, клип выйдет без чата."""
+def cut_vertical(raw: str, start: float, dur: float, out: str, job: dict, cfg: dict, headline: str = "") -> bool:
+    """Вертикальный клип 1080x1920. Чат и заголовок рисуются в отдельном процессе: если с ними что-то не так,
+    клип выйдет без них."""
     from . import vrender
-    spec = {"raw": raw, "start": start, "dur": dur, "out": out, "layout": cfg.get("tt_layout", "blur"),
+    spec = {"raw": raw, "start": start, "dur": dur, "out": out, "layout": cfg.get("tt_layout", "big"),
             "style": cfg.get("chat_style", "soft"), "size": cfg.get("chat_size", "m"),
-            "room_id": job.get("room_id", ""), "chat": []}
+            "room_id": job.get("room_id", ""), "chat": [], "headline": headline}
     if spec["style"] != "off":
         spec["chat"] = chatrender.select(job.get("chatlog") or [], start, dur, chatrender.hide_list(cfg.get("chat_hide", "")))
-    if spec["chat"]:
+    if spec["chat"] or spec["headline"]:
         path = raw[:-3] + ".vr.json"
         try:
             with open(path, "w", encoding="utf-8") as f:
@@ -109,16 +115,16 @@ def cut_vertical(raw: str, start: float, dur: float, out: str, job: dict, cfg: d
             r = util.run(util.worker_cmd("vrender", path), timeout=600)
             if r.returncode == 0 and os.path.exists(out) and os.path.getsize(out) > 50_000:
                 return True
-            log.warning("чат поверх клипа не получился (код %s), делаю клип без чата: %s", r.returncode,
+            log.warning("чат и заголовок поверх клипа не получились (код %s), делаю клип без них: %s", r.returncode,
                         r.stderr.decode("utf-8", "replace")[-300:])
         except Exception as e:
-            log.warning("чат поверх клипа не получился, делаю клип без чата: %s", e)
+            log.warning("чат и заголовок поверх клипа не получились, делаю клип без них: %s", e)
         finally:
             try:
                 os.remove(path)
             except OSError:
                 pass
-        spec["chat"] = []
+        spec["chat"], spec["headline"] = [], ""
     return vrender.render(spec)
 
 
@@ -166,8 +172,12 @@ def process(job_path: str) -> dict:
     start, end = choose_window(job, cfg)
     lo = max(job.get("win_start", 0.0), job.get("not_before", 0.0))
     hi = job.get("win_end", job["raw_dur"])
-    if end - start < 8:
-        return {"ok": True, "skipped": "слишком короткий кусок (пересекается с прошлым клипом или рекламой)"}
+    manual = job.get("kind") == "manual"
+    shortest = min_length(cfg, manual)
+    if end - start < shortest:
+        return {"ok": True, "skipped": "слишком короткий кусок (рядом прошлый клип, реклама или дыра в записи)"}
+    if not manual and not (start <= job["peak"] <= end + 1):
+        return {"ok": True, "skipped": "сам момент не попал в запись"}
 
     transcript = describe.transcribe(raw, max(lo, start - 12), min(hi, end + 6), cfg)
     title, quote = describe.heuristic(job, transcript)
@@ -178,8 +188,11 @@ def process(job_path: str) -> dict:
         if max(seg) > med * 4:
             score = min(100, score + 6)
 
-    verdict = describe.ai_verdict(job, transcript, lo, hi, (start, end), cfg) if job.get("kind") != "manual" else None
-    if verdict:
+    verdict = describe.ai_verdict(job, transcript, lo, hi, (start, end), cfg)
+    if verdict and manual:
+        # клип вырезан кнопкой: его границы и судьбу решил человек, от ИИ берём только слова
+        title, desc = verdict["title"] or title, verdict["description"]
+    elif verdict:
         if not verdict["keep"] and cfg.get("ai_filter"):
             return {"ok": True, "skipped": "ИИ решил, что момент не смешной"}
         # оценка ИИ и выученная оценка усредняются: ни одна не решает в одиночку
@@ -187,6 +200,7 @@ def process(job_path: str) -> dict:
         s, e = max(lo, verdict["start"]), min(hi, verdict["end"])
         if cfg["clip_min"] * 0.7 <= e - s <= cfg["clip_max"] * 1.2 and s < job["peak"] < e + 5:
             start, end = s, e
+    head = describe.headline(job, title, bool(verdict and verdict["title"]), cfg)
     if job.get("kind") != "manual" and score < int(cfg.get("min_score", 0)):
         return {"ok": True, "skipped": f"оценка {score} ниже порога"}
 
@@ -202,7 +216,7 @@ def process(job_path: str) -> dict:
     fmt = cfg.get("clip_format", "tiktok")
     wide, tall = str(folder / (name + ".mp4")), str(folder / (name + "_9x16.mp4"))
     made_wide = fmt in ("original", "both") and cut(raw, start, dur, wide)
-    made_tall = fmt != "original" and cut_vertical(raw, start, dur, tall, job, cfg)
+    made_tall = fmt != "original" and cut_vertical(raw, start, dur, tall, job, cfg, head)
     if not made_tall and not made_wide:                  # вертикальный не собрался: момент всё равно не теряем
         made_wide = cut(raw, start, dur, wide)
     if not made_tall and not made_wide:
@@ -210,6 +224,16 @@ def process(job_path: str) -> dict:
     out = tall if made_tall else wide                    # главный файл клипа; второй (если есть) идёт довеском
     extra = wide if made_tall and made_wide else None
     real_dur = probe_duration(out) or dur
+    if real_dur < min(shortest, dur * 0.6):
+        # В заготовке оказалось меньше видео, чем обещано: запись отставала от эфира. Обрубок в 2 секунды
+        # никому не нужен.
+        for p in (out, extra):
+            if p:
+                try:
+                    os.remove(p)
+                except OSError:
+                    pass
+        return {"ok": True, "skipped": f"в записи оказалось всего {real_dur:.0f} с видео вместо {dur:.0f}"}
     text = describe.caption(job, title, desc, quote, score, real_dur, time.strftime("%d.%m %H:%M", when))
     try:
         with open(str(folder / (name + ".txt")), "w", encoding="utf-8") as f:

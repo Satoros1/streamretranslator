@@ -156,6 +156,18 @@ class Bridge(QObject):
         threading.Thread(target=work, daemon=True).start()
 
 
+# Как оценивать клипы в канале. Ключ: включены ли там реакции (on, off, пусто = неизвестно).
+_HOW_TO_VOTE = ("Чтобы оценить клип, зажми сообщение с ним в канале (или дважды тапни) и поставь 👍 или 👎. "
+                "Считаются оценки всех подписчиков: чего под клипом больше, так он и оценён. Удалённый клип "
+                "считается плохим. На оценках программа учится, что брать, а что нет.")
+VOTES_TEXT = {
+    "": _HOW_TO_VOTE,
+    "on": "Реакции в канале включены ✅ " + _HOW_TO_VOTE,
+    "off": "В канале сейчас выключены реакции, поэтому оценить клип негде. Нажми кнопку ниже, и под клипами "
+           "появятся 👍 и 👎. " + _HOW_TO_VOTE,
+}
+
+
 # ----------------------------------------------------------------- карточка стрима
 STATE_CHIP = {"live": "chipLive", "ad": "chipWarn", "pause": "chipWarn", "error": "chipWarn",
               "restarting": "chipWarn", "offline": "chipGray", "starting": "chipGray", "paused": "chipGray"}
@@ -606,9 +618,37 @@ class MainWindow(QWidget):
         lay.addLayout(r)
         self.tg_msg = label("", "muted", wrap=True)
         lay.addWidget(self.tg_msg)
+
+        c, cl = card()
+        cl.addWidget(label("Оценки клипов", "h2"))
+        self.votes_lbl = label(VOTES_TEXT[""], "muted", wrap=True)
+        cl.addWidget(self.votes_lbl)
+        r = QHBoxLayout()
+        self.votes_btn = button("Включить оценки 👍 и 👎 в канале")
+        self.votes_btn.setToolTip("Разрешает в твоём канале реакции 👍 и 👎 под сообщениями. Остальные настройки канала "
+                                  "не меняются. Выключить можно в самом Telegram: канал → Изменить → Реакции")
+        self.votes_btn.clicked.connect(self.tg_votes_on)
+        self.votes_btn.setVisible(False)
+        r.addWidget(self.votes_btn)
+        r.addStretch(1)
+        cl.addLayout(r)
+        lay.addWidget(c)
         lay.addStretch(1)
         self._tg_mode_changed()
         return area
+
+    def tg_votes_on(self) -> None:
+        self.votes_btn.setEnabled(False)
+
+        def done(res, err):
+            self.votes_btn.setEnabled(True)
+            why = str(err) if err else res
+            if why:
+                self.tg_note(f"Оценки включить не получилось: {why}", True)
+            else:
+                self.tg_note("Готово: под клипами в канале теперь можно ставить 👍 и 👎.")
+
+        self.bridge.run(self.sup.tg.enable_reactions, done)
 
     def _tg_mode_changed(self) -> None:
         bot = self.tg_mode.currentData() == "bot"
@@ -760,9 +800,14 @@ class MainWindow(QWidget):
             ("clip_format", "Формат клипа", "Вертикальный: 1080×1920, сразу готов для TikTok, Shorts и Reels. "
              "«Как на стриме» сохраняет запись без изменений.", "choice",
              [("tiktok", "Вертикальный для TikTok"), ("original", "Как на стриме, 16:9"), ("both", "Оба файла")]),
-            ("tt_layout", "Вертикальный кадр", "Целиком: стрим виден весь, сверху и снизу размытый фон, чат под видео. "
-             "На весь экран: крупнее, но края по бокам обрезаются.", "choice",
-             [("blur", "Стрим целиком, фон размыт"), ("crop", "На весь экран")]),
+            ("tt_layout", "Вертикальный кадр", "Крупно: как в TikTok-нарезках, видео во всю ширину, края по бокам "
+             "немного обрезаются, чат под видео. Целиком: стрим виден весь, но мельче. На весь экран: ещё крупнее, "
+             "по бокам обрезается больше половины.", "choice",
+             [("big", "Крупно, как в TikTok-нарезках"), ("blur", "Стрим целиком, фон размыт"), ("crop", "На весь экран")]),
+            ("tt_title", "Заголовок над видео", "Крупная надпись над видео. С включённым ИИ программа сама пишет, что "
+             "происходит на экране. Без ИИ надпись простая: «Чат разрывает от смеха».", "bool", None),
+            ("tt_title_text", "Свой текст заголовка", "Если заполнить, эта надпись будет на каждом клипе. "
+             "Пусто: программа придумывает сама.", "text", None),
             ("chat_style", "Чат стрима в клипе", "Сообщения появляются в клипе тогда же, когда были в эфире. "
              "Удалённые модераторами сообщения, боты и ссылки не показываются.", "choice",
              [("soft", "Полупрозрачный"), ("text", "Только текст"), ("solid", "На тёмных плашках"), ("off", "Не показывать")]),
@@ -788,9 +833,11 @@ class MainWindow(QWidget):
              "фраза, которую сказал стример. При первом клипе скачает модель (около 500 МБ).", "bool", None),
             ("whisper_model", "Модель распознавания", "small: хороший баланс. medium точнее, но медленнее и тяжелее.",
              "choice", [("base", "base (быстрая)"), ("small", "small"), ("medium", "medium (точная)")]),
-            ("ai_enabled", "Описание и оценка от ИИ", "Claude читает расшифровку и чат, пишет заголовок и описание, "
-             "уточняет границы клипа. Один короткий запрос на клип, доли цента.", "bool", None),
+            ("ai_enabled", "Заголовок, описание и оценка от ИИ", "Claude читает расшифровку и чат, пишет заголовок и "
+             "описание, уточняет границы клипа. Один короткий запрос на клип, доли цента.", "bool", None),
             ("ai_api_key", "Ключ Anthropic API", "Берётся на console.anthropic.com. Хранится только на этом компьютере.", "secret", None),
+            ("ai_frames", "Показывать ИИ кадры из клипа", "ИИ видит, что происходит на экране, и заголовок получается "
+             "по делу, а не только по словам. Вместе с кадрами запрос всё равно стоит доли цента.", "bool", None),
             ("ai_filter", "Разрешить ИИ отбрасывать несмешное", "", "bool", None),
         ]),
         ("Система", [
@@ -917,6 +964,10 @@ class MainWindow(QWidget):
         tg = self.sup.tg
         q = tg.queue.counts(1.5).get("pending", 0) if self.sup.cfg.get("tg_enabled") else 0
         self.tg_chip.setText(tg.status_text + (f" · в очереди {q}" if q else ""))
+        votes = tg.votes if tg.status == "ok" else ""
+        if self.votes_lbl.text() != VOTES_TEXT[votes]:
+            self.votes_lbl.setText(VOTES_TEXT[votes])
+        self.votes_btn.setVisible(votes == "off")
         restyle(self.tg_chip, {"ok": "chip", "off": "chipGray", "connecting": "chipGray"}.get(tg.status, "chipWarn"))
         lines = [f"Telegram: {tg.status_text}" + (f", в очереди {q}" if q else "")]
         if tg.progress:
