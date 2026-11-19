@@ -35,6 +35,10 @@ POST_ROLL = 8
 MAX_RAW = 170
 CHAT_KEEP = 300       # сколько секунд чата помнить для показа поверх клипа
 STALL = 50            # видео идёт, а новых кусков на диске нет столько секунд = запись сломалась
+FLOOD_WINDOW = 600    # за сколько секунд считаем, не слишком ли часто идут клипы с одного канала
+# сколько клипов подряд берём без условий при каждой чувствительности; дальше нужна всё более высокая оценка
+FLOOD_FREE = {1: 1, 2: 1, 3: 1, 4: 2, 5: 99}
+FLOOD_STEPS = (60, 75, 88, 97)
 
 
 class Worker:
@@ -60,6 +64,7 @@ class Worker:
         self.buf_bytes = 0
         self.clips = 0
         self.last_clip_end = 0.0
+        self.recent_clips: list[float] = []              # когда выходили последние авто-клипы этого канала
         existing = segments.scan(self.buf_dir)
         self.run_no = (existing[-1].run if existing else 0) + 1
         self.first_run = self.run_no + 1                 # номер самого первого куска записи в этом запуске
@@ -440,6 +445,21 @@ class Worker:
         except Exception:
             log.exception("не получилось собрать заготовку клипа")
 
+    def _worth_a_clip(self, ev: Event, now: float) -> bool:
+        """Не даёт завалить клипами: когда моменты идут один за другим, проходят только самые сильные."""
+        self.recent_clips = [t for t in self.recent_clips if t > now - FLOOD_WINDOW]
+        bar = flood_bar(len(self.recent_clips), self.cfg.get("sensitivity", 3))
+        try:
+            score = self.learner.predict(self.channel, ev.features, ev.score)
+        except Exception:
+            score = ev.score
+        if score < bar:
+            log.info("момент с оценкой %d пропущен: за 10 минут уже %d клипов, сейчас беру только от %d",
+                     score, len(self.recent_clips), bar)
+            return False
+        self.recent_clips.append(now)
+        return True
+
     # --- главный цикл ---------------------------------------------------
     def run(self) -> int:
         threading.Thread(target=self._stdin_loop, daemon=True, name="stdin").start()
@@ -471,7 +491,7 @@ class Worker:
             with self.det_lock:
                 ev = self.det.tick(now)
                 rate, level, hot = self.det.rate, self.det.level, self.det.hype is not None
-            if ev:
+            if ev and self._worth_a_clip(ev, now):
                 threading.Thread(target=self._make_candidate, args=(ev,), daemon=True).start()
             if n % 5 == 0:
                 keep = max(4, float(self.cfg.get("buffer_minutes", 6))) * 60
@@ -483,6 +503,18 @@ class Worker:
         self.chat.stop()
         time.sleep(0.3)
         return 0
+
+
+def flood_bar(recent: int, sensitivity: int) -> int:
+    """Какая оценка нужна моменту, если за последние 10 минут с этого канала уже вышло recent клипов.
+
+    В очень живом чате (20 тысяч зрителей, смех без остановки) всплески идут каждую минуту. Клип на каждый
+    никому не нужен, поэтому чем больше клипов только что вышло, тем сильнее должен быть следующий момент.
+    """
+    extra = recent - FLOOD_FREE.get(int(sensitivity), 1)
+    if extra < 0:
+        return 0
+    return FLOOD_STEPS[min(extra, len(FLOOD_STEPS) - 1)]
 
 
 def recorder_cmd(buf_dir: Path, run: int, kind: str = "ts") -> list[str]:

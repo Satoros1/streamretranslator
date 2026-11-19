@@ -1,7 +1,7 @@
 from streamclipper.config import parse_channel
 from streamclipper.editor import choose_window, snap
 from streamclipper.segments import Segment, select
-from streamclipper.worker import pick_quality
+from streamclipper.worker import flood_bar, pick_quality
 
 CFG = {"clip_min": 25, "clip_max": 60, "lead_in": 20, "tail": 4, "manual_len": 45}
 
@@ -74,3 +74,19 @@ def test_pick_quality():
     assert pick_quality(names, "1080") == "1080p60"
     assert pick_quality(["360p", "720p", "720p60", "best"], "720") == "720p60"
     assert pick_quality(["1080p60", "best"], "480") == "1080p60"
+
+
+def test_first_clip_always_passes_then_the_bar_rises():
+    assert flood_bar(0, 3) == 0
+    assert [flood_bar(n, 3) for n in (1, 2, 3, 4, 9)] == [60, 75, 88, 97, 97]
+    assert flood_bar(1, 4) == 0 and flood_bar(2, 4) == 60        # чувствительность выше: клипов разрешено больше
+    assert flood_bar(50, 5) == 0                                 # «брать почти всё» значит брать всё
+
+
+def test_very_busy_chat_gives_only_the_strongest_moments():
+    # так было на настоящем стриме с 20 тысячами зрителей: шесть всплесков за восемь минут
+    taken = []
+    for score in (98, 65, 56, 77, 77, 56):
+        if score >= flood_bar(len(taken), 3):
+            taken.append(score)
+    assert taken == [98, 65, 77]
