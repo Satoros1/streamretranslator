@@ -6,6 +6,7 @@
 """
 from __future__ import annotations
 
+import collections
 import json
 import logging
 import os
@@ -31,6 +32,7 @@ GAP = 6.0             # нет данных столько секунд = раз
 PRE_ROLL = 45         # сколько секунд до реакции чата отдаём монтажёру на выбор
 POST_ROLL = 8
 MAX_RAW = 170
+CHAT_KEEP = 300       # сколько секунд чата помнить для показа поверх клипа
 
 
 class Worker:
@@ -58,7 +60,10 @@ class Worker:
         self.last_clip_end = 0.0
         existing = segments.scan(self.buf_dir)
         self.run_no = (existing[-1].run if existing else 0) + 1
-        self.chat = ChatClient(channel, self._on_chat)
+        self.chat = ChatClient(channel, self._on_chat, self._on_chat_delete)
+        # чат последних минут с цветами ников и смайлами: из него рисуется чат поверх клипа
+        self.chatlog: collections.deque = collections.deque()
+        self.chat_lock = threading.Lock()
 
     def _apply_learning(self) -> None:
         """Подхватывает то, чему программа научилась на оценках: порог и словарь этого канала."""
@@ -90,9 +95,30 @@ class Worker:
             pass
         self.stop.set()        # главный процесс закрылся: выходим, сиротами не остаёмся
 
-    def _on_chat(self, t: float, user: str, text: str) -> None:
+    def _on_chat(self, t: float, user: str, text: str, meta: dict | None = None) -> None:
         with self.det_lock:
             self.det.add_message(t, user, text)
+        meta = meta or {}
+        with self.chat_lock:
+            self.chatlog.append((t, user, meta.get("name") or user, meta.get("color", ""), text,
+                                 meta.get("emotes") or [], meta.get("id", "")))
+            while self.chatlog and self.chatlog[0][0] < t - CHAT_KEEP:
+                self.chatlog.popleft()
+
+    def _on_chat_delete(self, user: str, msg_id: str) -> None:
+        """Модератор удалил сообщение или забанил зрителя: в клип такое попадать не должно."""
+        with self.chat_lock:
+            if user == "*":
+                self.chatlog.clear()
+            elif msg_id:
+                self.chatlog = collections.deque(m for m in self.chatlog if m[6] != msg_id)
+            elif user:
+                self.chatlog = collections.deque(m for m in self.chatlog if m[1] != user)
+
+    def _chat_for(self, raw_start: float, raw_end: float) -> list[list]:
+        with self.chat_lock:
+            return [[round(t - raw_start, 2), name, color, text, emotes]
+                    for (t, _u, name, color, text, emotes, _id) in self.chatlog if raw_start - 8 <= t <= raw_end + 1]
 
     # --- источник видео -----------------------------------------------------
     def _open_source(self):
@@ -290,6 +316,7 @@ class Worker:
                 # авто-клипы не должны повторять друг друга; ручной клип берём целиком, как просили
                 "not_before": 0.0 if ev is None else max(0.0, self.last_clip_end - raw_start),
                 "win_start": start - raw_start, "win_end": end - raw_start,
+                "chatlog": self._chat_for(raw_start, segs[-1].end), "room_id": self.chat.room_id,
             }
             if ev is None:
                 job.update(onset=end - raw_start - 10, peak=end - raw_start - 8, end=end - raw_start,
@@ -393,15 +420,22 @@ def _fake_chat(worker: Worker) -> None:
     burst_at = float(os.environ.get("STREAMCLIPPER_FAKE_CHAT") or 95)
     t0 = time.time()
     rng = random.Random(7)
-    calm = ["привет", "какая игра", "го катку", "норм", "стример топ", "да", "нет", "когда турнир"]
-    fun = ["АХАХАХАХ", "ахахах", "KEKW", "ору", "пхпхпх", "что он несёт АХАХА", "LUL", "в нарезку"]
+    calm = ["привет", "какая игра", "го катку", "норм", "стример топ", "да", "нет", "когда турнир",
+            "а что за музыка играет?", "@strimer глянь донат", "всем привет из Казани 👋"]
+    fun = ["АХАХАХАХ", "ахахах", "KEKW", "ору", "пхпхпх", "что он несёт АХАХА", "LUL", "в нарезку",
+           "АХАХАХАХАХАХАХ я не могу", "это лучший момент за весь стрим", "ХАХАХАХА 😂😂😂", "нарезчики, работаем"]
+    names = ["Vasya_Pro", "котик_228", "DedInside", "n1ghtm4re", "Лёха", "mamkin_gamer", "xX_Sniper_Xx", "Ириска",
+             "tapok", "Kekster", "бублик", "zxc_ghoul", "Sanya1337", "pelmen", "Олежа", "moonlight"]
+    colors = ["#FF4500", "#1E90FF", "#9ACD32", "#FF69B4", "#8A2BE2", "#00FF7F", "#DAA520", "", "#0000FF", "#B22222"]
     worker.chat.connected = True
     while not worker.stop.is_set():
         el = time.time() - t0
         hot = burst_at <= el < burst_at + 15
         for _ in range(rng.randint(30, 45) if hot else rng.randint(6, 12)):
             text = rng.choice(fun) if (hot and rng.random() < 0.85) or rng.random() < 0.05 else rng.choice(calm)
-            worker._on_chat(time.time(), f"user{rng.randint(1, 500)}", text)
+            k = rng.randint(1, 500)
+            name = f"{names[k % len(names)]}{k if k % 3 == 0 else ''}"
+            worker._on_chat(time.time(), name.lower(), text, {"name": name, "color": colors[k % len(colors)]})
         time.sleep(1)
 
 

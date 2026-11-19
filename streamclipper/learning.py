@@ -115,9 +115,10 @@ class Learner:
             db.execute("DELETE FROM clips WHERE id=? AND path=''", (clip_id,))
 
     def label_path(self, path: str, good: bool | None, src: str) -> bool:
-        path = re.sub(r"_9x16(\.mp4)$", r"\1", path)
+        # у клипа может быть два файла (вертикальный и обычный): оценка любого из них относится к одному моменту
+        twin = re.sub(r"_9x16(\.mp4)$", r"\1", path) if path.endswith("_9x16.mp4") else re.sub(r"(\.mp4)$", r"_9x16\1", path)
         with self.lock, self._db() as db:
-            row = db.execute("SELECT id, label, label_src FROM clips WHERE path=?", (path,)).fetchone()
+            row = db.execute("SELECT id, label, label_src FROM clips WHERE path IN (?, ?)", (path, twin)).fetchone()
         if not row:
             return False
         if src == "telegram" and row["label_src"] == "app":

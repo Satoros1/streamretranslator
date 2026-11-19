@@ -43,6 +43,9 @@ def cli(argv: list[str]) -> int:
     if cmd == "edit":
         from . import editor
         return editor.main(argv[1])
+    if cmd == "vrender":
+        from . import vrender
+        return vrender.main(argv[1])
     if cmd == "selftest":
         return selftest()
     if cmd == "sl-version":

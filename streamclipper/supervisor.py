@@ -383,8 +383,8 @@ class Supervisor:
         self.events.put({"t": "clip", **res})
         if self.cfg.get("tg_enabled"):
             self.tg.enqueue(res["clip"], res["caption"])
-            if res.get("vertical"):
-                self.tg.enqueue(res["vertical"], res["caption"].split("\n")[0] + "\n📱 вертикальная версия 9:16")
+            if res.get("extra"):
+                self.tg.enqueue(res["extra"], res["caption"].split("\n")[0] + "\n🖥 обычная версия 16:9, как на стриме")
 
     # --- охрана ресурсов --------------------------------------------------
     def _guard_loop(self) -> None:

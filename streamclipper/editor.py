@@ -2,7 +2,8 @@
 
 Вход: заготовка (до ~3 минут видео вокруг реакции чата) и её описание в JSON.
 Выход: один непрерывный клип без склеек, файл с описанием и строка JSON в stdout.
-Видео не перекодируется (копируется как есть), поэтому качество не теряется и процессор почти не занят.
+Обычный клип 16:9 не перекодируется (копируется как есть): качество не теряется, процессор почти не занят.
+Вертикальный клип для TikTok собирается заново в 1080x1920, при желании с чатом стрима.
 """
 from __future__ import annotations
 
@@ -15,7 +16,7 @@ import sys
 import time
 from pathlib import Path
 
-from . import config, describe, util
+from . import chatrender, config, describe, util
 from .learning import Learner
 
 log = logging.getLogger("editor")
@@ -81,22 +82,44 @@ def choose_window(job: dict, cfg: dict) -> tuple[float, float]:
     return start, end
 
 
-def cut(raw: str, start: float, dur: float, out: str, vertical: bool = False) -> bool:
-    ff = util.find_tool("ffmpeg")
-    base = [ff, "-hide_banner", "-loglevel", "error", "-y", "-ss", f"{start:.3f}", "-i", raw, "-t", f"{dur:.3f}"]
-    if vertical:
-        # 9:16: исходное видео целиком по центру, сверху и снизу размытый фон из него же
-        vf = ("split[a][b];[a]scale=1080:1920:force_original_aspect_ratio=increase,crop=1080:1920,"
-              "boxblur=24:2[bg];[b]scale=1080:-2[fg];[bg][fg]overlay=(W-w)/2:(H-h)/2,format=yuv420p")
-        cmd = base + ["-filter_complex", vf, "-c:v", "libx264", "-preset", "veryfast", "-crf", "20",
-                      "-c:a", "aac", "-b:a", "160k", "-movflags", "+faststart", out]
-    else:
-        cmd = base + ["-map", "0:v:0?", "-map", "0:a:0?", "-c", "copy", "-avoid_negative_ts", "make_zero",
-                      "-movflags", "+faststart", out]
+def cut(raw: str, start: float, dur: float, out: str) -> bool:
+    """Клип как на стриме: без перекодирования."""
+    cmd = [util.find_tool("ffmpeg"), "-hide_banner", "-loglevel", "error", "-y", "-ss", f"{start:.3f}", "-i", raw,
+           "-t", f"{dur:.3f}", "-map", "0:v:0?", "-map", "0:a:0?", "-c", "copy", "-avoid_negative_ts", "make_zero",
+           "-movflags", "+faststart", out]
     r = util.run(cmd, timeout=900)
     if r.returncode != 0:
         log.warning("ffmpeg: %s", r.stderr.decode("utf-8", "replace")[-500:])
     return r.returncode == 0 and os.path.exists(out) and os.path.getsize(out) > 50_000
+
+
+def cut_vertical(raw: str, start: float, dur: float, out: str, job: dict, cfg: dict) -> bool:
+    """Вертикальный клип 1080x1920. Чат рисуется в отдельном процессе: если с ним что-то не так, клип выйдет без чата."""
+    from . import vrender
+    spec = {"raw": raw, "start": start, "dur": dur, "out": out, "layout": cfg.get("tt_layout", "blur"),
+            "style": cfg.get("chat_style", "soft"), "size": cfg.get("chat_size", "m"),
+            "room_id": job.get("room_id", ""), "chat": []}
+    if spec["style"] != "off":
+        spec["chat"] = chatrender.select(job.get("chatlog") or [], start, dur, chatrender.hide_list(cfg.get("chat_hide", "")))
+    if spec["chat"]:
+        path = raw[:-3] + ".vr.json"
+        try:
+            with open(path, "w", encoding="utf-8") as f:
+                json.dump(spec, f, ensure_ascii=False)
+            r = util.run(util.worker_cmd("vrender", path), timeout=600)
+            if r.returncode == 0 and os.path.exists(out) and os.path.getsize(out) > 50_000:
+                return True
+            log.warning("чат поверх клипа не получился (код %s), делаю клип без чата: %s", r.returncode,
+                        r.stderr.decode("utf-8", "replace")[-300:])
+        except Exception as e:
+            log.warning("чат поверх клипа не получился, делаю клип без чата: %s", e)
+        finally:
+            try:
+                os.remove(path)
+            except OSError:
+                pass
+        spec["chat"] = []
+    return vrender.render(spec)
 
 
 def probe_duration(path: str) -> float:
@@ -158,21 +181,26 @@ def process(job_path: str) -> dict:
     folder.mkdir(parents=True, exist_ok=True)
     safe_title = re.sub(r'[\\/:*?"<>|\r\n]+', " ", title).strip()[:50]
     name = f"{job['channel']}_{time.strftime('%Y-%m-%d_%H-%M-%S', when)}_{score:03d}_{safe_title}".rstrip(" ._")
-    out = str(folder / (name + ".mp4"))
-    if not cut(raw, start, dur, out):
+    fmt = cfg.get("clip_format", "tiktok")
+    wide, tall = str(folder / (name + ".mp4")), str(folder / (name + "_9x16.mp4"))
+    made_wide = fmt in ("original", "both") and cut(raw, start, dur, wide)
+    made_tall = fmt != "original" and cut_vertical(raw, start, dur, tall, job, cfg)
+    if not made_tall and not made_wide:                  # вертикальный не собрался: момент всё равно не теряем
+        made_wide = cut(raw, start, dur, wide)
+    if not made_tall and not made_wide:
         return {"ok": False, "error": "ffmpeg не смог вырезать клип"}
+    out = tall if made_tall else wide                    # главный файл клипа; второй (если есть) идёт довеском
+    extra = wide if made_tall and made_wide else None
     real_dur = probe_duration(out) or dur
-    vert = None
-    if cfg.get("vertical"):
-        v = str(folder / (name + "_9x16.mp4"))
-        if cut(raw, start, dur, v, vertical=True):
-            vert = v
     text = describe.caption(job, title, desc, quote, score, real_dur, time.strftime("%d.%m %H:%M", when))
     try:
         with open(str(folder / (name + ".txt")), "w", encoding="utf-8") as f:
             f.write(text + "\n")
             if transcript:
                 f.write("\n--- что говорил стример ---\n" + "\n".join(t for _a, _b, t in transcript) + "\n")
+            chat = chatrender.chat_text(job.get("chatlog") or [], start, dur)
+            if chat:
+                f.write("\n--- чат в этот момент ---\n" + chat + "\n")
     except OSError:
         pass
     try:
@@ -184,7 +212,7 @@ def process(job_path: str) -> dict:
             os.remove(p)
         except OSError:
             pass
-    return {"ok": True, "clip": out, "vertical": vert, "caption": text, "score": score, "channel": job["channel"],
+    return {"ok": True, "clip": out, "extra": extra, "caption": text, "score": score, "channel": job["channel"],
             "dur": round(real_dur, 1), "title": title, "kind": job.get("kind")}
 
 

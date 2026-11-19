@@ -81,12 +81,21 @@ jobs:
           Get-ChildItem shots\*.png | Format-Table Name, Length
           if (-not (Test-Path shots\page_4.png)) { exit 1 }
 
+      - name: Vertical clip with chat (built exe)
+        shell: pwsh
+        env:
+          PYTHONUTF8: "1"
+        run: |
+          python packaging/vertical_smoke.py dist\StreamClipper\sc-worker.exe
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+
       - name: Live Twitch smoke test (built exe)
         shell: pwsh
         continue-on-error: true
         timeout-minutes: 25
         env:
           SMOKE_OUT: smoke_clips
+          PYTHONUTF8: "1"
         run: |
           python packaging/live_smoke.py dist\StreamClipper\sc-worker.exe 240
 

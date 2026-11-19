@@ -12,6 +12,8 @@ import sys
 import tempfile
 import urllib.request
 
+sys.stdout.reconfigure(encoding="utf-8", errors="replace")     # в Windows вывод иначе не умеет русские буквы
+
 FALLBACK = ["buster", "evelone2004", "bratishkinoff", "zubarefff", "recrent", "stray228", "dmitry_lixxx",
             "by_owl", "t2x2", "mazellovvv", "pokanoname", "hellyeahplay"]
 
@@ -44,7 +46,7 @@ def main() -> int:
     clips = os.path.join(home, "clips")
     with open(os.path.join(home, "config.json"), "w", encoding="utf-8") as f:
         json.dump({"clips_dir": clips, "whisper": True, "whisper_model": "base", "manual_len": 30,
-                   "auto_update_streamlink": True, "max_streams": 8}, f)
+                   "auto_update_streamlink": True, "max_streams": 8, "clip_format": "both"}, f)
     channels = (live_ru() or FALLBACK)[:6]
     print("channels:", channels)
     env = dict(os.environ, STREAMCLIPPER_HOME=home, PYTHONIOENCODING="utf-8", PYTHONUTF8="1")
@@ -67,6 +69,11 @@ def main() -> int:
         os.makedirs(out, exist_ok=True)
         for p in sorted(found, key=os.path.getsize)[:2]:
             shutil.copy(p, out)
+        tall = [p for p in found if p.endswith("_9x16.mp4")]
+        print("vertical clips:", len(tall), "of", len(found))
+        for i, p in enumerate(tall[:3]):                    # кадры из вертикальных клипов: посмотреть чат на настоящем стриме
+            subprocess.run(["ffmpeg", "-hide_banner", "-loglevel", "error", "-y", "-ss", "20", "-i", p, "-frames:v", "1",
+                            "-vf", "scale=540:-2", os.path.join(out, "live_vertical_%d.jpg" % i)])
     print("LIVE SMOKE:", "PASSED, clips: %d" % len(found) if found else "NO CLIPS")
     return 0 if found else 1
 

@@ -7,3 +7,5 @@ ffmpeg/
 .pytest_cache/
 venv/
 .venv/
+shots/
+smoke_clips/

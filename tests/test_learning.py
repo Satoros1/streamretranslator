@@ -74,3 +74,16 @@ def test_learned_channel_word_triggers_detection():
     learned = run({"бабиджон"})
     assert len(learned) == 1 and "бабиджон" in learned[0].tokens
     assert learned[0].features["learned"] > 0.5
+
+
+def test_label_by_either_file_of_a_clip(tmp_path):
+    """У клипа может быть два файла, вертикальный и обычный: оценка любого относится к одному моменту."""
+    L = Learner(str(tmp_path / "l.db"))
+    L.record("a", "ch", "laugh", {"z": 5}, [], 60, 60)
+    L.set_clip("a", "/x/a_9x16.mp4", "t", "d", 60)
+    L.record("b", "ch", "laugh", {"z": 5}, [], 60, 60)
+    L.set_clip("b", "/x/b.mp4", "t", "d", 60)
+    assert L.label_path("/x/a.mp4", True, "app") and L.label_path("/x/b_9x16.mp4", False, "app")
+    labels = {r["id"]: r["label"] for r in L.recent()}
+    assert labels == {"a": 1, "b": 0}
+    assert not L.label_path("/x/zzz.mp4", True, "app")
