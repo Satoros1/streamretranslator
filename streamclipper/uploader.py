@@ -1,0 +1,407 @@
+"""Отправка клипов в Telegram-канал ФАЙЛОМ (документом), чтобы Telegram не пережимал видео.
+
+Работает через «настоящий» протокол Telegram (MTProto, библиотека Telethon), поэтому
+лимит на файл 2 ГБ, а не 50 МБ как у обычных ботов. Можно войти своим аккаунтом или ботом.
+Очередь лежит в базе на диске: если пропал интернет или программу закрыли,
+после запуска она дошлёт всё, что не успела.
+"""
+from __future__ import annotations
+
+import asyncio
+import logging
+import os
+import sqlite3
+import threading
+import time
+from collections import deque
+from typing import Callable
+
+from . import config
+
+log = logging.getLogger("telegram")
+MAX_ATTEMPTS = 15
+
+
+class UploadQueue:
+    def __init__(self):
+        self.path = str(config.data_dir() / "uploads.db")
+        self.lock = threading.Lock()
+        with self._db() as db:
+            db.execute("""CREATE TABLE IF NOT EXISTS uploads(
+                id INTEGER PRIMARY KEY AUTOINCREMENT, path TEXT, caption TEXT, status TEXT DEFAULT 'pending',
+                attempts INTEGER DEFAULT 0, next_try REAL DEFAULT 0, error TEXT DEFAULT '', created REAL, sent_at REAL)""")
+            cols = {r[1] for r in db.execute("PRAGMA table_info(uploads)")}
+            if "msg_id" not in cols:
+                db.execute("ALTER TABLE uploads ADD COLUMN msg_id INTEGER")
+                db.execute("ALTER TABLE uploads ADD COLUMN fb INTEGER")
+
+    def set_msg(self, id_: int, msg_id: int) -> None:
+        with self.lock, self._db() as db:
+            db.execute("UPDATE uploads SET msg_id=? WHERE id=?", (msg_id, id_))
+
+    def set_fb(self, id_: int, fb: int | None) -> None:
+        with self.lock, self._db() as db:
+            db.execute("UPDATE uploads SET fb=? WHERE id=?", (fb, id_))
+
+    def recent_sent(self, days: float = 3):
+        with self.lock, self._db() as db:
+            return db.execute("SELECT id, path, msg_id, fb FROM uploads WHERE status='sent' AND msg_id IS NOT NULL "
+                              "AND sent_at>? ORDER BY id DESC LIMIT 200", (time.time() - days * 86400,)).fetchall()
+
+    def _db(self):
+        db = sqlite3.connect(self.path, timeout=15)
+        db.row_factory = sqlite3.Row
+        return db
+
+    def add(self, path: str, caption: str) -> None:
+        with self.lock, self._db() as db:
+            db.execute("INSERT INTO uploads(path, caption, created) VALUES(?,?,?)", (path, caption, time.time()))
+
+    def next(self):
+        with self.lock, self._db() as db:
+            return db.execute("SELECT * FROM uploads WHERE status='pending' AND next_try<=? ORDER BY id LIMIT 1",
+                              (time.time(),)).fetchone()
+
+    def mark(self, id_: int, status: str, error: str = "", delay: float = 0) -> None:
+        with self.lock, self._db() as db:
+            db.execute("UPDATE uploads SET status=?, error=?, attempts=attempts+1, next_try=?, sent_at=? WHERE id=?",
+                       (status, error[:300], time.time() + delay, time.time() if status == "sent" else None, id_))
+
+    def postpone(self, id_: int, delay: float) -> None:
+        with self.lock, self._db() as db:
+            db.execute("UPDATE uploads SET next_try=? WHERE id=?", (time.time() + delay, id_))
+
+    def counts(self) -> dict:
+        with self.lock, self._db() as db:
+            rows = db.execute("SELECT status, COUNT(*) c FROM uploads GROUP BY status").fetchall()
+        return {r["status"]: r["c"] for r in rows}
+
+    def is_sent(self, path: str) -> bool:
+        with self.lock, self._db() as db:
+            return db.execute("SELECT 1 FROM uploads WHERE path=? AND status='sent'", (path,)).fetchone() is not None
+
+    def has_pending(self, path: str) -> bool:
+        with self.lock, self._db() as db:
+            return db.execute("SELECT 1 FROM uploads WHERE path=? AND status='pending'", (path,)).fetchone() is not None
+
+    def retry_failed(self) -> None:
+        with self.lock, self._db() as db:
+            db.execute("UPDATE uploads SET status='pending', attempts=0, next_try=0 WHERE status='failed'")
+
+    def cleanup(self) -> None:
+        with self.lock, self._db() as db:
+            db.execute("DELETE FROM uploads WHERE status='sent' AND sent_at<?", (time.time() - 30 * 86400,))
+
+
+class Telegram:
+    """Живёт в своём потоке. Всё наружу потокобезопасно."""
+
+    def __init__(self, on_event: Callable[[dict], None]):
+        self.on_event = on_event
+        self.queue = UploadQueue()
+        self.status = "off"          # off | connecting | need_login | no_channel | ok | error
+        self.status_text = "выключен"
+        self.me = ""
+        self.progress = ""
+        self._alerts: deque[str] = deque(maxlen=30)
+        self._alert_seen: dict[str, float] = {}
+        self._cfg: dict = {}
+        self._loop: asyncio.AbstractEventLoop | None = None
+        self._client = None
+        self._target = None
+        self._restart = threading.Event()
+        self._stop = threading.Event()
+        self._phone_hash = None
+        self._last_fb = 0.0
+        self._thread = threading.Thread(target=self._run, daemon=True, name="telegram")
+
+    # --- снаружи ----------------------------------------------------------
+    def start(self, cfg: dict) -> None:
+        self._cfg = dict(cfg)
+        if not self._thread.is_alive():
+            self._thread.start()
+
+    def reconfigure(self, cfg: dict) -> None:
+        keys = ("tg_enabled", "tg_mode", "tg_api_id", "tg_api_hash", "tg_bot_token", "tg_phone", "tg_channel")
+        changed = any(self._cfg.get(k) != cfg.get(k) for k in keys)
+        self._cfg = dict(cfg)
+        if changed:
+            self._restart.set()
+
+    def stop(self) -> None:
+        self._stop.set()
+        self._restart.set()
+
+    def enqueue(self, path: str, caption: str) -> None:
+        self.queue.add(path, caption)
+
+    def alert(self, text: str, key: str | None = None, every: float = 1800) -> None:
+        """Служебное уведомление. Одно и то же (по key) не чаще, чем раз в every секунд."""
+        if not self._cfg.get("tg_alerts", True):
+            return
+        now = time.time()
+        if key:
+            if now - self._alert_seen.get(key, 0) < every:
+                return
+            self._alert_seen[key] = now
+        self._alerts.append(text)
+
+    def call(self, coro_fn, timeout: float = 60):
+        """Выполнить корутину в потоке Telegram и дождаться результата (для окна настроек)."""
+        if not self._loop:
+            raise RuntimeError("Telegram ещё не запущен")
+        return asyncio.run_coroutine_threadsafe(coro_fn(), self._loop).result(timeout)
+
+    # --- вход по коду (режим «свой аккаунт») ------------------------------
+    def request_code(self, phone: str) -> str:
+        async def go():
+            if not self._client:
+                raise RuntimeError("Сначала сохрани api_id и api_hash")
+            sent = await self._client.send_code_request(phone)
+            self._phone_hash = (phone, sent.phone_code_hash)
+            return "Код отправлен в Telegram"
+        return self.call(go)
+
+    def submit_code(self, code: str, password: str = "") -> str:
+        async def go():
+            from telethon import errors
+            phone, h = self._phone_hash or (self._cfg.get("tg_phone", ""), None)
+            try:
+                await self._client.sign_in(phone=phone, code=code.strip(), phone_code_hash=h)
+            except errors.SessionPasswordNeededError:
+                if not password:
+                    return "2fa"
+                await self._client.sign_in(password=password)
+            self._restart.set()
+            return "ok"
+        return self.call(go)
+
+    def list_channels(self) -> list[tuple[str, str]]:
+        """Каналы и группы, куда можно писать. Для выпадающего списка в настройках."""
+        async def go():
+            out = []
+            async for d in self._client.iter_dialogs(limit=400):
+                e = d.entity
+                if d.is_channel and (getattr(e, "creator", False) or getattr(e, "admin_rights", None)
+                                     or getattr(e, "megagroup", False)):
+                    out.append((str(d.id), d.name or str(d.id)))
+            return out
+        return self.call(go, 90)
+
+    def logout(self) -> None:
+        async def go():
+            await self._client.log_out()
+        try:
+            self.call(go, 30)
+        finally:
+            self._restart.set()
+
+    # --- поток ------------------------------------------------------------
+    def _set(self, status: str, text: str) -> None:
+        if (status, text) != (self.status, self.status_text):
+            self.status, self.status_text = status, text
+            self.on_event({"t": "tg", "status": status, "text": text})
+
+    def _run(self) -> None:
+        self._loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(self._loop)
+        while not self._stop.is_set():
+            self._restart.clear()
+            try:
+                self._loop.run_until_complete(self._session())
+            except Exception as e:
+                log.exception("сессия Telegram упала")
+                self._set("error", f"ошибка: {str(e)[:120]}")
+            if self._stop.is_set():
+                break
+            # перезапуск сразу, если поменяли настройки, иначе пауза
+            self._restart.wait(0.5 if self._restart.is_set() else 20)
+
+    async def _session(self) -> None:
+        cfg = self._cfg
+        self._client = None
+        if not cfg.get("tg_enabled"):
+            self._set("off", "выключен")
+            await self._wait_restart()
+            return
+        try:
+            api_id = int(str(cfg.get("tg_api_id", "")).strip())
+            api_hash = str(cfg.get("tg_api_hash", "")).strip()
+            assert api_hash
+        except Exception:
+            self._set("error", "не заполнены api_id и api_hash")
+            await self._wait_restart()
+            return
+        from telethon import TelegramClient, errors
+
+        bot = cfg.get("tg_mode") == "bot"
+        self._set("connecting", "подключаюсь…")
+        session = str(config.data_dir() / ("telegram_bot" if bot else "telegram_user"))
+        client = TelegramClient(session, api_id, api_hash, flood_sleep_threshold=180,
+                                connection_retries=10, retry_delay=3, auto_reconnect=True,
+                                device_model="StreamClipper", app_version="1.0")
+        self._client = client
+        try:
+            await client.connect()
+            if not await client.is_user_authorized():
+                if bot:
+                    token = str(cfg.get("tg_bot_token", "")).strip()
+                    if not token:
+                        self._set("error", "не указан токен бота")
+                        await self._wait_restart()
+                        return
+                    await client.sign_in(bot_token=token)
+                else:
+                    self._set("need_login", "нужно войти в аккаунт (Настройки → Telegram)")
+                    await self._wait_restart()
+                    return
+            me = await client.get_me()
+            self.me = getattr(me, "username", None) or getattr(me, "first_name", "") or ""
+            self._target = None
+            spec = str(cfg.get("tg_channel", "")).strip()
+            if spec:
+                try:
+                    self._target = await self._resolve(client, spec, bot)
+                except Exception as e:
+                    self._set("no_channel", f"канал не найден: {str(e)[:80]}")
+            else:
+                self._set("no_channel", "не выбран канал")
+            if self._target is not None:
+                self._set("ok", f"подключён ({self.me})")
+            await self._work(client, errors, bot)
+        finally:
+            try:
+                await client.disconnect()
+            except Exception:
+                pass
+
+    async def _wait_restart(self) -> None:
+        while not self._restart.is_set():
+            await asyncio.sleep(0.5)
+
+    @staticmethod
+    async def _resolve(client, spec: str, bot: bool):
+        s = spec.strip()
+        for p in ("https://", "http://"):
+            if s.startswith(p):
+                s = s[len(p):]
+        if s.startswith("t.me/") and not s.startswith(("t.me/+", "t.me/joinchat")):
+            s = "@" + s[5:].split("/")[0].split("?")[0]
+        if s.lstrip("-").isdigit():
+            n = int(s)
+            if not bot:
+                await client.get_dialogs(limit=400)        # чтобы Telegram «узнал» канал по номеру
+            return await client.get_input_entity(n)
+        if s.startswith("t.me/"):
+            s = "https://" + s
+        return await client.get_input_entity(s)
+
+    GOOD = set("👍❤🔥😁🤣😂👏💯⚡🏆😆🥰🤩😍")
+    BAD = set("👎💩🤮😴🥱😐🤡")
+
+    async def _read_feedback(self, client) -> None:
+        """Оценки прямо в канале: 👍 под клипом = хороший, 👎 или удалённый пост = плохой."""
+        rows = self.queue.recent_sent()
+        for i in range(0, len(rows), 90):
+            part = rows[i:i + 90]
+            msgs = await client.get_messages(self._target, ids=[r["msg_id"] for r in part])
+            for r, m in zip(part, msgs):
+                if m is None:
+                    fb = 0                                   # пост удалили: клип не понравился
+                else:
+                    good = bad = 0
+                    for rc in (getattr(getattr(m, "reactions", None), "results", None) or []):
+                        emo = getattr(rc.reaction, "emoticon", "")
+                        if emo in self.GOOD:
+                            good += rc.count
+                        elif emo in self.BAD:
+                            bad += rc.count
+                    fb = 1 if good > bad else 0 if bad > good else None
+                if fb != r["fb"]:
+                    self.queue.set_fb(r["id"], fb)
+                    if fb is not None:
+                        self.on_event({"t": "reaction", "path": r["path"], "good": bool(fb)})
+
+    async def _work(self, client, errors, bot: bool) -> None:
+        last_cleanup = 0.0
+        while not self._restart.is_set():
+            if not client.is_connected():
+                raise ConnectionError("соединение с Telegram потеряно")
+            # 1) служебные уведомления
+            while self._alerts:
+                text = self._alerts.popleft()
+                try:
+                    dest = str(self._cfg.get("tg_alerts_chat", "")).strip()
+                    if dest:
+                        target = await self._resolve(client, dest, bot)
+                    elif not bot:
+                        target = "me"                       # «Избранное» владельца
+                    else:
+                        target = None                       # бот без чата для уведомлений молчит
+                    if target is not None:
+                        await client.send_message(target, "🛠 StreamClipper\n" + text)
+                except Exception as e:
+                    log.warning("не смог отправить уведомление: %s", e)
+            # 2) клипы
+            row = self.queue.next() if self._target is not None else None
+            if row is None and self._target is not None and time.time() - self._last_fb > 300:
+                self._last_fb = time.time()
+                try:
+                    await self._read_feedback(client)
+                except Exception as e:
+                    log.info("не смог прочитать реакции: %s", e)
+            if row is None:
+                if time.time() - last_cleanup > 3600:
+                    self.queue.cleanup()
+                    last_cleanup = time.time()
+                await asyncio.sleep(1.5)
+                continue
+            path = row["path"]
+            if not os.path.exists(path):
+                self.queue.mark(row["id"], "missing", "файл удалён")
+                continue
+            name = os.path.basename(path)
+            size = os.path.getsize(path)
+
+            def prog(sent, total, name=name):
+                self.progress = f"{name}: {100 * sent // max(total, 1)}%"
+
+            try:
+                msg = await client.send_file(self._target, path, caption=row["caption"] or "", force_document=True,
+                                             parse_mode=None, progress_callback=prog, part_size_kb=512)
+                self.queue.mark(row["id"], "sent")
+                try:
+                    self.queue.set_msg(row["id"], int(msg.id))
+                except Exception:
+                    pass
+                self.progress = ""
+                self._set("ok", f"подключён ({self.me})")
+                self.on_event({"t": "uploaded", "path": path, "size": size})
+                if self._cfg.get("delete_after_upload"):
+                    for p in (path, os.path.splitext(path)[0] + ".txt"):
+                        try:
+                            os.remove(p)
+                        except OSError:
+                            pass
+            except errors.FloodWaitError as e:
+                log.warning("Telegram просит подождать %s с", e.seconds)
+                self._set("ok", f"Telegram просит подождать {e.seconds} с")
+                self.queue.postpone(row["id"], e.seconds + 3)
+                await asyncio.sleep(min(e.seconds + 3, 30))
+            except (errors.ChatWriteForbiddenError, errors.ChatAdminRequiredError, errors.ChannelPrivateError) as e:
+                self._set("no_channel", "нет прав писать в канал: сделай аккаунт/бота админом")
+                self.queue.postpone(row["id"], 120)
+                log.warning("нет прав на канал: %s", e)
+                await asyncio.sleep(10)
+            except (ConnectionError, OSError, asyncio.TimeoutError) as e:
+                self.queue.postpone(row["id"], 20)
+                raise ConnectionError(str(e))
+            except Exception as e:
+                attempts = row["attempts"] + 1
+                log.warning("отправка %s не удалась (%s/%s): %s", name, attempts, MAX_ATTEMPTS, e)
+                if attempts >= MAX_ATTEMPTS:
+                    self.queue.mark(row["id"], "failed", str(e))
+                    self.on_event({"t": "upload_failed", "path": path, "error": str(e)[:200]})
+                else:
+                    self.queue.mark(row["id"], "pending", str(e), delay=min(30 * 2 ** attempts, 900))
+                await asyncio.sleep(2)

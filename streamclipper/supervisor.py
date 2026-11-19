@@ -1,0 +1,500 @@
+"""Главный диспетчер: следит за процессами записи, очередью монтажа, диском и Telegram.
+
+Правило: ничто не должно ронять программу целиком. Упал процесс стрима, он перезапускается.
+Завис (молчит 90 секунд), его убивают и запускают заново. Не смонтировался клип, пробуем ещё раз.
+"""
+from __future__ import annotations
+
+import glob
+import json
+import logging
+import os
+import queue
+import subprocess
+import threading
+import time
+from pathlib import Path
+
+from . import config, segments, system, updater, util
+from .learning import Learner
+from .uploader import Telegram
+
+log = logging.getLogger("supervisor")
+
+HANG_SECONDS = 90
+STATE_RU = {
+    "starting": "запускается", "offline": "не в эфире", "live": "идёт запись", "ad": "реклама, пропускаю",
+    "pause": "нет данных, жду", "error": "ошибка", "paused": "пауза", "restarting": "перезапуск",
+    "stopped": "остановлен",
+}
+
+
+class WorkerHandle:
+    def __init__(self, name: str):
+        self.name = name
+        self.proc: subprocess.Popen | None = None
+        self.status: dict = {"state": "starting"}
+        self.last_msg = 0.0
+        self.next_start = 0.0
+        self.backoff = 3.0
+        self.started = 0.0
+        self.restarts = 0
+        self.clips = 0
+        self.error_since = 0.0
+        self.live_since = 0.0
+
+
+class Supervisor:
+    def __init__(self):
+        self.cfg = config.load()
+        self.events: queue.Queue = queue.Queue()        # всё, что надо показать в окне
+        self.workers: dict[str, WorkerHandle] = {}
+        self.lock = threading.RLock()
+        self.stop = threading.Event()
+        self.edit_q: queue.Queue = queue.Queue()
+        self.edit_fail: dict[str, int] = {}
+        self.editing = ""
+        self.tg = Telegram(self._on_tg)
+        self.learner = Learner()
+        self.stats = self._load_stats()
+        self.low_disk = False
+        self.cpu = 0.0
+        self.ram = 0.0
+        self.free_gb = util.free_gb(self.cfg["clips_dir"])
+        self.update: tuple[str, str] | None = None
+        self._cpu_hot = 0
+
+    # --- события для окна --------------------------------------------------
+    def say(self, text: str, level: str = "info") -> None:
+        log.info(text)
+        self.events.put({"t": "log", "text": text, "level": level, "time": time.strftime("%H:%M:%S")})
+
+    def _on_tg(self, ev: dict) -> None:
+        if ev["t"] == "uploaded":
+            self.stats["sent"] = self.stats.get("sent", 0) + 1
+            self._save_stats()
+            self.say(f"Отправлено в Telegram: {os.path.basename(ev['path'])} ({ev['size'] / 1e6:.0f} МБ)")
+        elif ev["t"] == "upload_failed":
+            self.say(f"Не удалось отправить {os.path.basename(ev['path'])}: {ev['error']}", "error")
+        elif ev["t"] == "reaction":
+            if self.learner.label_path(ev["path"], ev["good"], "telegram"):
+                self.say(f"Оценка из Telegram: {'👍' if ev['good'] else '👎'} {os.path.basename(ev['path'])}")
+                self._learning_changed()
+        elif ev["t"] == "tg":
+            self.say(f"Telegram: {ev['text']}", "error" if ev["status"] == "error" else "info")
+
+    def label_clip(self, clip_id: str, good: bool | None) -> None:
+        """Оценка клипа из окна программы. После неё всё переобучается и сразу применяется."""
+        if self.learner.label(clip_id, good, "app"):
+            self._learning_changed()
+
+    def _learning_changed(self) -> None:
+        with self.lock:
+            for h in self.workers.values():
+                self._send(h, cmd="reload")
+        self.events.put({"t": "learned"})
+
+    # --- статистика за день (для вечерней сводки) -----------------------
+    def _stats_path(self) -> Path:
+        return config.data_dir() / "stats.json"
+
+    def _load_stats(self) -> dict:
+        try:
+            with open(self._stats_path(), "r", encoding="utf-8") as f:
+                s = json.load(f)
+        except Exception:
+            s = {}
+        if s.get("date") != time.strftime("%Y-%m-%d"):
+            s = {"date": time.strftime("%Y-%m-%d"), "made": {}, "sent": 0, "summary_sent": False}
+        return s
+
+    def _save_stats(self) -> None:
+        try:
+            with open(self._stats_path(), "w", encoding="utf-8") as f:
+                json.dump(self.stats, f, ensure_ascii=False)
+        except OSError:
+            pass
+
+    # --- запуск/остановка -----------------------------------------------
+    def start(self) -> None:
+        os.makedirs(self.cfg["clips_dir"], exist_ok=True)
+        for name in self.cfg["channels"]:
+            self.workers[name] = WorkerHandle(name)
+        for job in sorted(glob.glob(str(config.subdir("candidates") / "*.json"))):
+            self.edit_q.put(job)                        # недоделанное с прошлого запуска
+        self.tg.start(self.cfg)
+        system.prevent_sleep(bool(self.cfg.get("prevent_sleep")))
+        for target, name in ((self._monitor_loop, "monitor"), (self._edit_loop, "editor"),
+                             (self._guard_loop, "guard"), (self._update_loop, "updates")):
+            threading.Thread(target=target, daemon=True, name=name).start()
+        self.say(f"Запущено. Каналов: {len(self.workers)}")
+
+    def shutdown(self) -> None:
+        self.stop.set()
+        with self.lock:
+            for h in self.workers.values():
+                self._stop_worker(h)
+        self.tg.stop()
+        system.prevent_sleep(False)
+
+    def _spawn(self, h: WorkerHandle) -> None:
+        env = dict(os.environ, PYTHONIOENCODING="utf-8", PYTHONUTF8="1")
+        try:
+            h.proc = subprocess.Popen(util.worker_cmd("worker", h.name), stdin=subprocess.PIPE,
+                                      stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, env=env,
+                                      text=True, encoding="utf-8", errors="replace", bufsize=1,
+                                      creationflags=util.NO_WINDOW)
+        except OSError as e:
+            h.status = {"state": "error", "detail": f"не запускается: {e}"}
+            h.next_start = time.time() + 30
+            return
+        h.started = h.last_msg = time.time()
+        h.status = {"state": "starting"}
+        threading.Thread(target=self._read_worker, args=(h, h.proc), daemon=True, name=f"rd-{h.name}").start()
+
+    def _read_worker(self, h: WorkerHandle, proc: subprocess.Popen) -> None:
+        try:
+            for line in proc.stdout:
+                try:
+                    msg = json.loads(line)
+                except ValueError:
+                    continue
+                h.last_msg = time.time()
+                t = msg.get("t")
+                if t == "status":
+                    h.status = msg
+                    if msg.get("state") == "live":
+                        h.backoff = 3.0
+                elif t == "candidate":
+                    self.say(f"{h.name}: пойман момент" + (f" (оценка {msg['score']})" if msg.get("score") else "")
+                             + ", монтирую…")
+                    self.edit_q.put(msg["job"])
+                elif t == "event":
+                    k = msg.get("kind")
+                    if k == "online":
+                        h.live_since = time.time()
+                        self.say(f"{h.name}: стрим в эфире, качество {msg.get('quality', '?')}")
+                    elif k == "offline":
+                        self.say(f"{h.name}: стрим закончился")
+                        self.tg.alert(f"📴 {h.name}: стрим закончился. Жду следующего.", f"off-{h.name}", 600)
+                    elif k == "no_video":
+                        self.say(f"{h.name}: клип не сделан, в буфере пока нет видео", "error")
+                    elif k == "disk_full":
+                        self.say("Диск почти заполнен, клип пропущен", "error")
+        except Exception:
+            log.exception("чтение вывода %s", h.name)
+
+    def _stop_worker(self, h: WorkerHandle) -> None:
+        p, h.proc = h.proc, None
+        if not p:
+            return
+        try:
+            p.stdin.write('{"cmd":"stop"}\n')
+            p.stdin.flush()
+            p.stdin.close()
+        except (OSError, ValueError):
+            pass
+        try:
+            p.wait(6)
+        except subprocess.TimeoutExpired:
+            p.kill()
+
+    def _send(self, h: WorkerHandle, **cmd) -> bool:
+        try:
+            h.proc.stdin.write(json.dumps(cmd) + "\n")
+            h.proc.stdin.flush()
+            return True
+        except (OSError, ValueError, AttributeError):
+            return False
+
+    def _monitor_loop(self) -> None:
+        while not self.stop.wait(1.0):
+            now = time.time()
+            with self.lock:
+                for h in list(self.workers.values()):
+                    try:
+                        self._check(h, now)
+                    except Exception:
+                        log.exception("monitor %s", h.name)
+
+    def _check(self, h: WorkerHandle, now: float) -> None:
+        if h.proc is None:
+            if now >= h.next_start:
+                self._spawn(h)
+            return
+        code = h.proc.poll()
+        hung = now - h.last_msg > HANG_SECONDS
+        if code is None and not hung:
+            st = h.status.get("state")
+            if st == "error":
+                h.error_since = h.error_since or now
+                if now - h.error_since > 300:
+                    self.tg.alert(f"⚠️ {h.name}: уже 5 минут не получается открыть стрим.\n"
+                                  f"{h.status.get('detail', '')}", f"err-{h.name}", 3600)
+            else:
+                h.error_since = 0.0
+            return
+        if hung and code is None:
+            self.say(f"{h.name}: процесс завис, перезапускаю", "error")
+            h.proc.kill()
+        else:
+            self.say(f"{h.name}: процесс неожиданно завершился (код {code}), перезапускаю", "error")
+        h.proc = None
+        h.restarts += 1
+        h.status = {"state": "restarting"}
+        h.next_start = now + h.backoff
+        h.backoff = min(h.backoff * 2, 60.0)
+        if h.restarts % 5 == 0:
+            self.tg.alert(f"⚠️ {h.name}: запись перезапускалась уже {h.restarts} раз. Загляни в программу.",
+                          f"restart-{h.name}", 3600)
+
+    # --- команды из окна --------------------------------------------------
+    def add_channel(self, text: str) -> tuple[bool, str]:
+        name = config.parse_channel(text)
+        if not name:
+            return False, "Не похоже на ссылку Twitch. Пример: https://www.twitch.tv/имя_канала"
+        with self.lock:
+            if name in self.workers:
+                return False, "Этот канал уже в списке"
+            if len(self.workers) >= int(self.cfg.get("max_streams", 6)):
+                return False, f"Лимит {self.cfg['max_streams']} стримов одновременно (меняется в настройках)"
+            self.workers[name] = WorkerHandle(name)
+            self.cfg["channels"] = list(self.workers)
+            config.save(self.cfg)
+        self.say(f"Добавлен канал {name}")
+        return True, name
+
+    def remove_channel(self, name: str) -> None:
+        with self.lock:
+            h = self.workers.pop(name, None)
+            self.cfg["channels"] = list(self.workers)
+            config.save(self.cfg)
+        if h:
+            self._stop_worker(h)
+            segments.wipe(config.subdir("buffer") / name)
+            self.say(f"Канал {name} удалён")
+
+    def clip_now(self, name: str) -> bool:
+        with self.lock:
+            h = self.workers.get(name)
+            ok = bool(h and h.proc and self._send(h, cmd="clip_now"))
+        self.say(f"{name}: делаю клип последних {self.cfg['manual_len']} секунд" if ok
+                 else f"{name}: сейчас не записывается", "info" if ok else "error")
+        return ok
+
+    def apply_config(self, cfg: dict) -> None:
+        with self.lock:
+            cfg["channels"] = list(self.workers)
+            restart = any(self.cfg.get(k) != cfg.get(k) for k in ("quality", "twitch_oauth"))
+            self.cfg = cfg
+            config.save(cfg)
+            os.makedirs(cfg["clips_dir"], exist_ok=True)
+            for h in self.workers.values():
+                if restart:
+                    self._stop_worker(h)
+                    h.next_start = 0
+                else:
+                    self._send(h, cmd="reload")
+        self.tg.reconfigure(cfg)
+        system.prevent_sleep(bool(cfg.get("prevent_sleep")))
+        system.set_autostart(bool(cfg.get("autostart")))
+        self.say("Настройки сохранены")
+
+    def set_paused(self, paused: bool) -> None:
+        cfg = dict(self.cfg, paused=paused)
+        self.apply_config(cfg)
+        self.say("Запись на паузе" if paused else "Запись возобновлена")
+
+    def snapshot(self) -> list[dict]:
+        out = []
+        with self.lock:
+            for h in self.workers.values():
+                s = h.status
+                state = s.get("state", "starting")
+                text = STATE_RU.get(state, state)
+                if state == "error" and s.get("detail"):
+                    text += ": " + s["detail"][:60]
+                if state == "live" and s.get("hot"):
+                    text = "🔥 движ в чате!"
+                out.append({"name": h.name, "state": state, "text": text, "rate": s.get("rate", 0),
+                            "level": s.get("level", 0), "buf_mb": s.get("buf_mb", 0), "clips": h.clips,
+                            "quality": s.get("quality", ""), "title": s.get("title", ""),
+                            "chat": s.get("chat", False)})
+        return out
+
+    # --- монтаж -----------------------------------------------------------
+    def _edit_loop(self) -> None:
+        while not self.stop.is_set():
+            try:
+                job = self.edit_q.get(timeout=1)
+            except queue.Empty:
+                continue
+            if not os.path.exists(job):
+                continue
+            if self.low_disk:
+                self.say("Мало места на диске: клип пропущен", "error")
+                self._drop_job(job)
+                continue
+            self.editing = os.path.basename(job)
+            try:
+                r = subprocess.run(util.worker_cmd("edit", job), stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+                                   stderr=subprocess.DEVNULL, timeout=1500, creationflags=util.NO_WINDOW,
+                                   env=dict(os.environ, PYTHONIOENCODING="utf-8", PYTHONUTF8="1"))
+                lines = r.stdout.decode("utf-8", "replace").strip().splitlines()
+                res = json.loads(lines[-1]) if lines else {"ok": False, "error": "монтажёр ничего не ответил"}
+            except subprocess.TimeoutExpired:
+                res = {"ok": False, "error": "монтаж шёл дольше 25 минут"}
+            except Exception as e:
+                res = {"ok": False, "error": str(e)[:200]}
+            self.editing = ""
+            self._edit_done(job, res)
+
+    def _drop_job(self, job: str) -> None:
+        for p in (job, job[:-5] + ".ts"):
+            try:
+                os.remove(p)
+            except OSError:
+                pass
+
+    def _edit_done(self, job: str, res: dict) -> None:
+        if not res.get("ok"):
+            n = self.edit_fail.get(job, 0) + 1
+            self.edit_fail[job] = n
+            if n < 2 and not res.get("fatal"):
+                self.say(f"Монтаж не удался ({res.get('error')}), пробую ещё раз", "error")
+                self.edit_q.put(job)
+            else:
+                self.say(f"Клип не получился: {res.get('error')}", "error")
+                self._drop_job(job)
+            return
+        if res.get("skipped"):
+            self.say(f"Момент пропущен: {res['skipped']}")
+            self._drop_job(job)
+            return
+        ch = res["channel"]
+        with self.lock:
+            if ch in self.workers:
+                self.workers[ch].clips += 1
+        if self.stats.get("date") != time.strftime("%Y-%m-%d"):
+            self.stats = self._load_stats()
+        self.stats["made"][ch] = self.stats["made"].get(ch, 0) + 1
+        self._save_stats()
+        self.say(f"✂️ {ch}: клип готов, {res['dur']:.0f} с, оценка {res['score']}: {os.path.basename(res['clip'])}")
+        self.events.put({"t": "clip", **res})
+        if self.cfg.get("tg_enabled"):
+            self.tg.enqueue(res["clip"], res["caption"])
+            if res.get("vertical"):
+                self.tg.enqueue(res["vertical"], res["caption"].split("\n")[0] + "\n📱 вертикальная версия 9:16")
+
+    # --- охрана ресурсов --------------------------------------------------
+    def _guard_loop(self) -> None:
+        try:
+            import psutil
+            psutil.cpu_percent(None)
+        except Exception:
+            psutil = None
+        n = 0
+        while not self.stop.wait(10):
+            n += 1
+            try:
+                cfg = self.cfg
+                self.free_gb = min(util.free_gb(cfg["clips_dir"]), util.free_gb(config.data_dir()))
+                low = self.free_gb < float(cfg.get("min_free_gb", 5))
+                if low and not self.low_disk:
+                    self.say(f"На диске осталось {self.free_gb:.1f} ГБ. Новые клипы не сохраняю, пока не освободится место",
+                             "error")
+                    self.tg.alert(f"💽 На диске осталось {self.free_gb:.1f} ГБ. Клипы не сохраняются, освободи место.",
+                                  "disk", 3600)
+                self.low_disk = low
+                if psutil:
+                    self.cpu = psutil.cpu_percent(None)
+                    self.ram = psutil.virtual_memory().percent
+                    self._cpu_hot = self._cpu_hot + 1 if (self.cpu > 93 or self.ram > 93) else 0
+                    if self._cpu_hot >= 18:                         # 3 минуты подряд
+                        self._cpu_hot = 0
+                        self.say("Компьютер перегружен. Убери один стрим или понизь качество записи", "error")
+                        self.tg.alert(f"🥵 Компьютер перегружен (процессор {self.cpu:.0f}%, память {self.ram:.0f}%). "
+                                      "Убери один стрим или понизь качество записи.", "cpu", 3600)
+                if n % 30 == 1:
+                    self._trim_clips()
+                    self._clean_candidates()
+                self._daily_summary()
+            except Exception:
+                log.exception("guard")
+
+    def _trim_clips(self) -> None:
+        """Папка клипов не растёт бесконечно: сверх лимита удаляются самые старые уже отправленные."""
+        cap = float(self.cfg.get("max_clips_gb", 30)) * 1e9
+        if cap <= 0:
+            return
+        files = []
+        for root, _d, names in os.walk(self.cfg["clips_dir"]):
+            for nme in names:
+                if nme.lower().endswith(".mp4"):
+                    p = os.path.join(root, nme)
+                    try:
+                        st = os.stat(p)
+                        files.append((st.st_mtime, st.st_size, p))
+                    except OSError:
+                        pass
+        total = sum(f[1] for f in files)
+        if total <= cap:
+            return
+        tg_on = bool(self.cfg.get("tg_enabled"))
+        for _mt, size, p in sorted(files):
+            if total <= cap * 0.9:
+                break
+            if tg_on and self.tg.queue.has_pending(p):
+                continue                                    # ещё не отправлен: не трогаем
+            try:
+                os.remove(p)
+                total -= size
+                txt = os.path.splitext(p)[0] + ".txt"
+                if os.path.exists(txt):
+                    os.remove(txt)
+            except OSError:
+                pass
+        self.say("Папка клипов превысила лимит: удалил самые старые")
+
+    def _clean_candidates(self) -> None:
+        d = config.subdir("candidates")
+        now = time.time()
+        for p in d.glob("*.ts"):
+            try:
+                if now - p.stat().st_mtime > 3600 and not p.with_suffix(".json").exists():
+                    p.unlink()
+            except OSError:
+                pass
+
+    def _daily_summary(self) -> None:
+        if self.stats.get("date") != time.strftime("%Y-%m-%d"):
+            self.stats = self._load_stats()
+        if self.stats.get("summary_sent") or time.localtime().tm_hour < 23:
+            return
+        self.stats["summary_sent"] = True
+        self._save_stats()
+        made = self.stats.get("made", {})
+        if not made:
+            return
+        lines = [f"• {ch}: {n}" for ch, n in sorted(made.items(), key=lambda x: -x[1])]
+        c = self.tg.queue.counts()
+        self.tg.alert("📊 Итоги дня\nКлипов сделано: " + str(sum(made.values())) + "\n" + "\n".join(lines)
+                      + f"\nОтправлено: {self.stats.get('sent', 0)}, в очереди: {c.get('pending', 0)}"
+                      + f"\nСвободно на диске: {self.free_gb:.0f} ГБ")
+
+    def _update_loop(self) -> None:
+        if self.stop.wait(20):
+            return
+        while True:
+            try:
+                self.update = updater.check_app_update()
+                if self.update:
+                    self.events.put({"t": "update", "version": self.update[0], "url": self.update[1]})
+                if self.cfg.get("auto_update_streamlink", True):
+                    new = updater.update_streamlink()
+                    if new:
+                        self.say(f"Модуль записи Twitch обновлён до {new}. Применится при следующем запуске стрима")
+            except Exception as e:
+                log.info("проверка обновлений: %s", e)
+            if self.stop.wait(12 * 3600):
+                return

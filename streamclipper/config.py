@@ -1,0 +1,138 @@
+"""Настройки и пути. Всё хранится в одной папке данных, чтобы переживать перезапуски."""
+from __future__ import annotations
+
+import json
+import os
+import re
+import sys
+import threading
+from pathlib import Path
+
+from . import APP_NAME
+
+_lock = threading.Lock()
+
+
+def data_dir() -> Path:
+    env = os.environ.get("STREAMCLIPPER_HOME")
+    if env:
+        p = Path(env)
+    elif sys.platform == "win32":
+        p = Path(os.environ.get("LOCALAPPDATA", str(Path.home()))) / APP_NAME
+    else:
+        p = Path.home() / ".streamclipper"
+    p.mkdir(parents=True, exist_ok=True)
+    return p
+
+
+def subdir(name: str) -> Path:
+    p = data_dir() / name
+    p.mkdir(parents=True, exist_ok=True)
+    return p
+
+
+def default_clips_dir() -> str:
+    return str(Path.home() / "Videos" / APP_NAME)
+
+
+DEFAULTS: dict = {
+    "channels": [],
+    "paused": False,
+    # запись
+    "quality": "best",          # best | 1080 | 720 | 480
+    "buffer_minutes": 6,        # сколько последних минут держим на диске на каждый стрим
+    "twitch_oauth": "",         # необязательно: токен аккаунта с Turbo/подпиской (без рекламы)
+    "max_streams": 6,
+    # клипы
+    "clips_dir": "",
+    "clip_min": 25,
+    "clip_max": 60,
+    "lead_in": 20,              # сколько секунд ДО реакции чата берём (сам момент + подводка)
+    "tail": 4,
+    "manual_len": 45,           # длина клипа по кнопке «Клип сейчас»
+    "sensitivity": 3,           # 1 (только самый жир) .. 5 (берём почти всё)
+    "min_score": 0,             # не сохранять клипы с оценкой ниже
+    "vertical": False,          # дополнительно делать 9:16 для TikTok/Shorts
+    "max_clips_gb": 30,         # потолок папки клипов, старые отправленные удаляются
+    "min_free_gb": 5,           # если на диске меньше, запись клипов ставится на паузу
+    # распознавание речи и ИИ
+    "whisper": True,
+    "whisper_model": "small",
+    "ai_enabled": False,
+    "ai_api_key": "",
+    "ai_model": "claude-haiku-5-5",
+    "ai_filter": False,         # позволить ИИ отбраковывать несмешное
+    # telegram
+    "tg_enabled": False,
+    "tg_mode": "user",          # user (аккаунт) | bot
+    "tg_api_id": "",
+    "tg_api_hash": "",
+    "tg_bot_token": "",
+    "tg_phone": "",
+    "tg_channel": "",           # @username, ссылка t.me/... или числовой id
+    "tg_alerts_chat": "",       # куда слать служебные уведомления; пусто = «Избранное»/канал
+    "tg_alerts": True,
+    "delete_after_upload": False,
+    # система
+    "autostart": False,
+    "prevent_sleep": True,
+    "auto_update_streamlink": True,
+}
+
+
+def config_path() -> Path:
+    return data_dir() / "config.json"
+
+
+def load() -> dict:
+    cfg = dict(DEFAULTS)
+    try:
+        with open(config_path(), "r", encoding="utf-8") as f:
+            raw = json.load(f)
+        if isinstance(raw, dict):
+            cfg.update({k: v for k, v in raw.items() if k in DEFAULTS})
+    except FileNotFoundError:
+        pass
+    except Exception:
+        # битый файл: не падаем, а берём резервную копию
+        try:
+            with open(str(config_path()) + ".bak", "r", encoding="utf-8") as f:
+                cfg.update({k: v for k, v in json.load(f).items() if k in DEFAULTS})
+        except Exception:
+            pass
+    if not cfg["clips_dir"]:
+        cfg["clips_dir"] = default_clips_dir()
+    return cfg
+
+
+def save(cfg: dict) -> None:
+    with _lock:
+        path = config_path()
+        tmp = str(path) + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump({k: cfg.get(k, v) for k, v in DEFAULTS.items()}, f, ensure_ascii=False, indent=2)
+        if path.exists():
+            try:
+                os.replace(path, str(path) + ".bak")
+            except OSError:
+                pass
+        os.replace(tmp, path)
+
+
+_CHANNEL_RE = re.compile(r"(?:https?://)?(?:www\.|m\.)?twitch\.tv/([A-Za-z0-9_]{2,30})", re.I)
+
+
+def parse_channel(text: str) -> str | None:
+    """Принимает ссылку на стрим или просто ник. Возвращает ник в нижнем регистре."""
+    text = (text or "").strip()
+    m = _CHANNEL_RE.search(text)
+    if m:
+        name = m.group(1)
+    elif re.fullmatch(r"@?[A-Za-z0-9_]{2,30}", text):
+        name = text.lstrip("@")
+    else:
+        return None
+    name = name.lower()
+    if name in {"videos", "directory", "settings", "downloads", "p", "popout"}:
+        return None
+    return name
