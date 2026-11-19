@@ -473,8 +473,8 @@ def test_update_button_downloads_installs_and_closes_the_program(window, monkeyp
 
 def test_failed_download_can_be_retried_or_done_by_hand(window, monkeypatch):
     win = window
-    started = []
-    monkeypatch.setattr(win, "confirm_update", lambda: True)
+    started, asked = [], []
+    monkeypatch.setattr(win, "confirm_update", lambda: asked.append(1) or True)
     monkeypatch.setattr(win.sup, "download_update", lambda: started.append(1) or True)
     win.feed(t="update", version="v99.0.0", url=REPO + "/releases/tag/v99.0.0", auto=True)
     win.update_btn.click()
@@ -485,6 +485,7 @@ def test_failed_download_can_be_retried_or_done_by_hand(window, monkeypatch):
     assert win.opened == [REPO + "/releases/tag/v99.0.0"]
     win.update_btn.click()
     assert started == [1, 1] and win.update_alt.isHidden()
+    assert asked == [1]                                              # «Повторить» второй раз не спрашивает
 
 
 def test_installer_that_does_not_start_keeps_the_program_running(window, monkeypatch):
