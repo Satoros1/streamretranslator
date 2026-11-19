@@ -117,6 +117,52 @@ def test_title_is_the_right_ffmpeg_input():
     assert "overlay=140:170[titled]" in top
 
 
+def test_whole_stream_layout_keeps_the_edges():
+    """Основной вид: стрим в кадре целиком, по бокам ничего не срезается (вебка и чат стримера стоят у краёв)."""
+    for w, h in ((1920, 1080), (1280, 720), (1664, 936)):
+        g = vrender.geometry("blur", w, h, chat=True, title=True)
+        assert g["mode"] == "blur" and abs(g["fg_h"] - vrender.W * h / w) <= 1      # высота по пропорции: без приближения
+        side, y = g["title"]
+        assert side == "bottom" and y == g["vy"] - vrender.TITLE_GAP             # заголовок прямо над видео
+        assert g["vy"] >= 3 * round(70 * 1.22) + 2 * round(70 * 0.34) + 120      # три строки заголовка влезают
+        x, cy, cw, ch = g["chat"]
+        assert cy >= g["vy"] + g["fg_h"] and cy + ch <= vrender.H - 250          # чат под видео, низ под подписи TikTok
+
+
+@needs_ffmpeg
+def test_default_clip_shows_the_stream_from_edge_to_edge(tmp_path, monkeypatch):
+    """Клип с настройками по умолчанию: у левого края стрима красная полоса («вебка»), у правого синяя («чат
+    стримера»). Обе должны быть в клипе целиком, у самых краёв кадра."""
+    pytest.importorskip("PySide6")
+    monkeypatch.setenv("STREAMCLIPPER_HOME", str(tmp_path / "home"))
+    monkeypatch.setenv("QT_QPA_PLATFORM", "offscreen")
+    raw = str(tmp_path / "raw.ts")
+    made = subprocess.run(["ffmpeg", "-hide_banner", "-loglevel", "error", "-y", "-f", "lavfi", "-i",
+                           "color=c=0x30A030:size=1920x1080:rate=30,drawbox=x=0:y=0:w=160:h=ih:color=red:t=fill,"
+                           "drawbox=x=iw-160:y=0:w=160:h=ih:color=blue:t=fill", "-f", "lavfi", "-i", "sine=frequency=440",
+                           "-t", "12", "-c:v", "libx264", "-preset", "ultrafast", "-g", "30", "-c:a", "aac", "-f", "mpegts", raw])
+    if made.returncode != 0:
+        pytest.skip("в этом ffmpeg нет кодировщика для тестового видео")
+    out = str(tmp_path / "clip_9x16.mp4")
+    cfg = config.load()
+    chat = [[2.0 + i * 0.5, f"user{i}", "", "АХАХАХ", []] for i in range(10)]
+    assert editor.cut_vertical(raw, 1.0, 9.0, out, {"chatlog": chat, "room_id": ""}, cfg, "вебка на месте")
+    shot = str(tmp_path / "shot.png")
+    subprocess.run(["ffmpeg", "-hide_banner", "-loglevel", "error", "-y", "-ss", "5", "-i", out, "-frames:v", "1", shot])
+    from PySide6.QtGui import QImage
+    img = QImage(shot)
+    assert (img.width(), img.height()) == (1080, 1920)
+    geo = vrender.geometry(cfg["tt_layout"], 1920, 1080, chat=True, title=True)
+    y = geo["vy"] + geo["fg_h"] // 2
+    left, right, mid = img.pixelColor(8, y), img.pixelColor(1080 - 9, y), img.pixelColor(540, y)
+    assert left.red() > 180 and left.blue() < 80, left.getRgb()                  # левый край стрима в кадре
+    assert right.blue() > 180 and right.red() < 80, right.getRgb()               # и правый
+    assert mid.green() > 120 and mid.red() < 90
+    # полосы видны во всю свою ширину: 160 из 1920 точек стрима это 90 точек клипа
+    assert img.pixelColor(80, y).red() > 180 and img.pixelColor(100, y).green() > 120
+    assert img.pixelColor(1080 - 81, y).blue() > 180 and img.pixelColor(1080 - 101, y).green() > 120
+
+
 # ---- что написать над видео ----
 
 def test_what_goes_above_the_video():
@@ -242,19 +288,30 @@ def test_ai_without_frames_and_for_a_manual_clip(ai, tmp_path):
 
 # ---- настройки ----
 
-def test_new_look_becomes_the_default_once(tmp_path, monkeypatch):
+def test_whole_stream_becomes_the_default_once(tmp_path, monkeypatch):
     monkeypatch.setenv("STREAMCLIPPER_HOME", str(tmp_path / "home"))
-    assert config.load()["tt_layout"] == "big" and config.load()["tt_title"] is True     # новая установка
+    assert config.load()["tt_layout"] == "blur" and config.load()["tt_title"] is True    # новая установка
     path = config.config_path()
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(json.dumps({"tt_layout": "blur", "channels": ["a"]}), encoding="utf-8")       # настройки от 0.1.1
+    # настройки от 0.1.2 и 0.1.3: там основным был вид «крупно», он срезал края стрима
+    path.write_text(json.dumps({"tt_layout": "big", "look": 1, "channels": ["a"]}), encoding="utf-8")
     cfg = config.load()
-    assert cfg["tt_layout"] == "big" and cfg["look"] == 1 and cfg["channels"] == ["a"]
-    path.write_text(json.dumps({"tt_layout": "crop"}), encoding="utf-8")         # человек выбирал вид сам: не трогаем
+    assert cfg["tt_layout"] == "blur" and cfg["look"] == 2 and cfg["channels"] == ["a"]
+    path.write_text(json.dumps({"tt_layout": "blur", "channels": ["a"]}), encoding="utf-8")       # настройки от 0.1.1
+    assert config.load()["tt_layout"] == "blur"
+    path.write_text(json.dumps({"tt_layout": "crop", "look": 1}), encoding="utf-8")       # выбирал вид сам: не трогаем
     assert config.load()["tt_layout"] == "crop"
-    cfg = dict(config.load(), tt_layout="blur")                  # вернул прежний вид уже в новой версии
+    cfg = dict(config.load(), tt_layout="big")                   # выбрал «крупно» уже в новой версии
     config.save(cfg)
-    assert config.load()["tt_layout"] == "blur"                  # и он остаётся
+    assert config.load()["tt_layout"] == "big"                   # и оно остаётся
+
+
+def test_settings_offer_the_whole_stream_first():
+    pytest.importorskip("PySide6")
+    from streamclipper import gui
+    src = open(gui.__file__, encoding="utf-8").read()
+    choices = src[src.index('("tt_layout"'):]
+    assert choices.index('("blur"') < choices.index('("big"') < choices.index('("crop"')
 
 
 # ---- всё вместе: настоящий клип ----
@@ -291,7 +348,7 @@ def test_vertical_clip_with_headline_and_chat(tmp_path, monkeypatch):
     subprocess.run(["ffmpeg", "-hide_banner", "-loglevel", "error", "-y", "-ss", "6", "-i", res["clip"], "-frames:v", "1", shot])
     from PySide6.QtGui import QImage
     img = QImage(shot)
-    geo = vrender.geometry("big", 1280, 720, chat=True, title=True)
+    geo = vrender.geometry("blur", 1280, 720, chat=True, title=True)
     band = [img.pixelColor(x, y).lightness() for y in range(geo["vy"] - 200, geo["vy"] - 20, 4) for x in range(100, 980, 4)]
     assert sum(1 for v in band if v > 225) > 150 and sum(1 for v in band if v < 30) > 2000, (max(band), min(band))
     assert not [f for f in os.listdir(os.path.dirname(res["clip"])) if f.endswith(".png")]       # картинка заголовка убрана
