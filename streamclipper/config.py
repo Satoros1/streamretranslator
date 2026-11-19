@@ -4,8 +4,10 @@ from __future__ import annotations
 import json
 import os
 import re
+import shutil
 import sys
 import threading
+import time
 from pathlib import Path
 
 from . import APP_NAME
@@ -117,10 +119,17 @@ def save(cfg: dict) -> None:
             json.dump({k: cfg.get(k, v) for k, v in DEFAULTS.items()}, f, ensure_ascii=False, indent=2)
         if path.exists():
             try:
-                os.replace(path, str(path) + ".bak")
-            except OSError:
+                shutil.copyfile(path, str(path) + ".bak")      # копия, а не переименование: файл настроек
+            except OSError:                                    # ни на миг не пропадает с диска
                 pass
-        os.replace(tmp, path)
+        for attempt in range(8):
+            try:
+                os.replace(tmp, path)
+                break
+            except PermissionError:                            # Windows: файл в этот миг читает другой процесс
+                if attempt == 7:
+                    raise
+                time.sleep(0.05 * (attempt + 1))
 
 
 _CHANNEL_RE = re.compile(r"(?:https?://)?(?:www\.|m\.)?twitch\.tv/([A-Za-z0-9_]{2,30})", re.I)

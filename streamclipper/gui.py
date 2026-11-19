@@ -229,6 +229,7 @@ class MainWindow(QWidget):
         self.bridge = Bridge()
         self.cards: dict[str, StreamCard] = {}
         self.really_quit = False
+        self.update_url: str | None = None
         self.setObjectName("root")
         self.setWindowTitle(APP_NAME)
         self.setWindowIcon(T.app_icon())
@@ -400,7 +401,7 @@ class MainWindow(QWidget):
         live = sum(1 for x in snap if x["state"] in ("live", "ad", "pause"))
         self.stat["live"].setText(f"{live} из {len(snap)}" if snap else "0")
         self.stat["clips"].setText(str(sum(self.sup.stats.get("made", {}).values())))
-        q = self.sup.tg.queue.counts().get("pending", 0) if self.sup.cfg.get("tg_enabled") else 0
+        q = self.sup.tg.queue.counts(1.5).get("pending", 0) if self.sup.cfg.get("tg_enabled") else 0
         self.stat["queue"].setText(str(q))
         self.stat["disk"].setText(f"{self.sup.free_gb:.0f} ГБ")
 
@@ -594,8 +595,7 @@ class MainWindow(QWidget):
         save.clicked.connect(self.tg_save)
         r.addWidget(save)
         test = button("Отправить проверочное сообщение")
-        test.clicked.connect(lambda: (self.sup.tg.alert("Проверка связи: всё работает ✅"), self.tg_note("Отправил. "
-                             "Сообщение придёт в чат для уведомлений (по умолчанию «Избранное»).")))
+        test.clicked.connect(self.tg_test)
         r.addWidget(test)
         r.addStretch(1)
         lay.addLayout(r)
@@ -631,6 +631,18 @@ class MainWindow(QWidget):
     def tg_save(self) -> None:
         self.sup.apply_config(self._tg_collect())
         self.tg_note("Сохранено. Состояние подключения видно вверху страницы.")
+
+    def tg_test(self) -> None:
+        tg = self.sup.tg
+        if tg.status not in ("ok", "no_channel"):
+            return self.tg_note(f"Telegram пока не подключён ({tg.status_text}). Сначала нажми «Сохранить и "
+                                "подключиться» и дождись состояния «подключён».", True)
+        if not self.sup.cfg.get("tg_alerts", True):
+            return self.tg_note("Уведомления выключены галочкой выше: включи её и сохрани.", True)
+        if self.sup.cfg.get("tg_mode") == "bot" and not str(self.sup.cfg.get("tg_alerts_chat", "")).strip():
+            return self.tg_note("Боту нужно указать, куда слать уведомления: впиши чат в поле выше и сохрани.", True)
+        tg.alert("Проверка связи: всё работает ✅")
+        self.tg_note("Отправил. Сообщение придёт в чат для уведомлений (по умолчанию «Избранное»).")
 
     def tg_request_code(self) -> None:
         cfg = self._tg_collect()
@@ -875,7 +887,9 @@ class MainWindow(QWidget):
                     self.tray.showMessage(APP_NAME, f"Новый клип: {ev.get('channel')}", T.app_icon(), 4000)
             elif t == "update":
                 self.update_label.setText(f"Вышла новая версия {ev['version']}")
-                self.update_btn.clicked.connect(lambda _=False, u=ev["url"]: webbrowser.open(u))
+                if self.update_url is None:               # проверка идёт дважды в сутки: кнопку подключаем один раз
+                    self.update_btn.clicked.connect(lambda: webbrowser.open(self.update_url or ""))
+                self.update_url = ev["url"]
                 self.update_bar.show()
         if not self.isVisible():
             return
@@ -883,7 +897,7 @@ class MainWindow(QWidget):
         if clips_changed and self.stack.currentIndex() == 1:
             self.refresh_clips()
         tg = self.sup.tg
-        q = tg.queue.counts().get("pending", 0) if self.sup.cfg.get("tg_enabled") else 0
+        q = tg.queue.counts(1.5).get("pending", 0) if self.sup.cfg.get("tg_enabled") else 0
         self.tg_chip.setText(tg.status_text + (f" · в очереди {q}" if q else ""))
         restyle(self.tg_chip, {"ok": "chip", "off": "chipGray", "connecting": "chipGray"}.get(tg.status, "chipWarn"))
         lines = [f"Telegram: {tg.status_text}" + (f", в очереди {q}" if q else "")]

@@ -10,6 +10,7 @@ import json
 import logging
 import os
 import queue
+import shutil
 import subprocess
 import threading
 import time
@@ -116,11 +117,37 @@ class Supervisor:
             pass
 
     # --- запуск/остановка -----------------------------------------------
+    def _check_clips_dir(self, cfg: dict) -> bool:
+        """Папка клипов может оказаться недоступной (вынули внешний диск). Программа из-за этого падать не должна."""
+        try:
+            os.makedirs(cfg["clips_dir"], exist_ok=True)
+            return True
+        except OSError as e:
+            self.say(f"Папка для клипов недоступна ({cfg['clips_dir']}): {e}. Пока она не вернётся, клипы "
+                     f"сохраняются в {config.default_clips_dir()}", "error")
+            return False
+
+    def _clean_buffers(self) -> None:
+        """Убирает записи каналов, которых уже нет в списке: они больше никому не нужны, а место занимают."""
+        try:
+            for d in config.subdir("buffer").iterdir():
+                if d.is_dir() and d.name not in self.workers:
+                    shutil.rmtree(d, ignore_errors=True)
+        except OSError:
+            pass
+
     def start(self) -> None:
-        os.makedirs(self.cfg["clips_dir"], exist_ok=True)
+        self._check_clips_dir(self.cfg)
         for name in self.cfg["channels"]:
             self.workers[name] = WorkerHandle(name)
+        self._clean_buffers()
         for job in sorted(glob.glob(str(config.subdir("candidates") / "*.json"))):
+            if job.endswith(".vr.json"):                # служебный файл недоделанного монтажа, а не заготовка клипа
+                try:
+                    os.remove(job)
+                except OSError:
+                    pass
+                continue
             self.edit_q.put(job)                        # недоделанное с прошлого запуска
         self.tg.start(self.cfg)
         system.prevent_sleep(bool(self.cfg.get("prevent_sleep")))
@@ -132,10 +159,17 @@ class Supervisor:
     def shutdown(self) -> None:
         self.stop.set()
         with self.lock:
-            for h in self.workers.values():
-                self._stop_worker(h)
+            names = list(self.workers)
+            self._stop_all(list(self.workers.values()))
         self.tg.stop()
         system.prevent_sleep(False)
+        # После выхода запись в буфере уже не пригодится, а это до 350 МБ на каждый стрим.
+        # ffmpeg дописывает последний кусок ещё мгновение после остановки, поэтому две попытки.
+        for attempt in range(2):
+            for name in names:
+                segments.wipe(config.subdir("buffer") / name)
+            if attempt == 0:
+                time.sleep(0.5)
 
     def _spawn(self, h: WorkerHandle) -> None:
         env = dict(os.environ, PYTHONIOENCODING="utf-8", PYTHONUTF8="1")
@@ -184,20 +218,38 @@ class Supervisor:
         except Exception:
             log.exception("чтение вывода %s", h.name)
 
-    def _stop_worker(self, h: WorkerHandle) -> None:
+    def _stop_worker(self, h: WorkerHandle, wait: bool = True) -> subprocess.Popen | None:
         p, h.proc = h.proc, None
         if not p:
-            return
+            return None
         try:
             p.stdin.write('{"cmd":"stop"}\n')
             p.stdin.flush()
             p.stdin.close()
         except (OSError, ValueError):
             pass
+        if wait:
+            self._reap(p, 6.0)
+        return p
+
+    @staticmethod
+    def _reap(p: subprocess.Popen, timeout: float) -> None:
         try:
-            p.wait(6)
+            p.wait(timeout)
         except subprocess.TimeoutExpired:
             p.kill()
+            try:
+                p.wait(3)
+            except subprocess.TimeoutExpired:
+                pass
+
+    def _stop_all(self, handles: list[WorkerHandle]) -> None:
+        """Останавливает несколько процессов записи разом: всем команда, потом общее ожидание.
+        По очереди выход из программы с шестью стримами занимал бы до полуминуты."""
+        procs = [p for p in (self._stop_worker(h, wait=False) for h in handles) if p]
+        deadline = time.time() + 6
+        for p in procs:
+            self._reap(p, max(0.2, deadline - time.time()))
 
     def _send(self, h: WorkerHandle, **cmd) -> bool:
         try:
@@ -218,6 +270,8 @@ class Supervisor:
                         log.exception("monitor %s", h.name)
 
     def _check(self, h: WorkerHandle, now: float) -> None:
+        if self.stop.is_set():
+            return                                      # программа закрывается: никого не перезапускаем
         if h.proc is None:
             if now >= h.next_start:
                 self._spawn(h)
@@ -237,6 +291,7 @@ class Supervisor:
         if hung and code is None:
             self.say(f"{h.name}: процесс завис, перезапускаю", "error")
             h.proc.kill()
+            self._reap(h.proc, 3.0)
         else:
             self.say(f"{h.name}: процесс неожиданно завершился (код {code}), перезапускаю", "error")
         h.proc = None
@@ -288,10 +343,11 @@ class Supervisor:
             restart = any(self.cfg.get(k) != cfg.get(k) for k in ("quality", "twitch_oauth"))
             self.cfg = cfg
             config.save(cfg)
-            os.makedirs(cfg["clips_dir"], exist_ok=True)
+            self._check_clips_dir(cfg)
+            if restart:
+                self._stop_all(list(self.workers.values()))
             for h in self.workers.values():
                 if restart:
-                    self._stop_worker(h)
                     h.next_start = 0
                 else:
                     self._send(h, cmd="reload")
@@ -336,10 +392,15 @@ class Supervisor:
                 self._drop_job(job)
                 continue
             self.editing = os.path.basename(job)
+            env = dict(os.environ, PYTHONIOENCODING="utf-8", PYTHONUTF8="1")
+            if self.edit_fail.get(job):
+                # Первая попытка не удалась. Чаще всего виновато распознавание речи (нет памяти, зависла загрузка
+                # модели, сбой библиотеки), поэтому вторая идёт без него и без ИИ: клип важнее описания.
+                env["STREAMCLIPPER_SAFE_EDIT"] = "1"
             try:
                 r = subprocess.run(util.worker_cmd("edit", job), stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
-                                   stderr=subprocess.DEVNULL, timeout=1500, creationflags=util.NO_WINDOW,
-                                   env=dict(os.environ, PYTHONIOENCODING="utf-8", PYTHONUTF8="1"))
+                                   stderr=subprocess.DEVNULL, timeout=1500,
+                                   creationflags=util.NO_WINDOW | util.LOW_PRIORITY, env=env)
                 lines = r.stdout.decode("utf-8", "replace").strip().splitlines()
                 res = json.loads(lines[-1]) if lines else {"ok": False, "error": "монтажёр ничего не ответил"}
             except subprocess.TimeoutExpired:
@@ -366,7 +427,9 @@ class Supervisor:
             else:
                 self.say(f"Клип не получился: {res.get('error')}", "error")
                 self._drop_job(job)
+                self.edit_fail.pop(job, None)
             return
+        self.edit_fail.pop(job, None)
         if res.get("skipped"):
             self.say(f"Момент пропущен: {res['skipped']}")
             self._drop_job(job)
@@ -430,8 +493,8 @@ class Supervisor:
         files = []
         for root, _d, names in os.walk(self.cfg["clips_dir"]):
             for nme in names:
-                if nme.lower().endswith(".mp4"):
-                    p = os.path.join(root, nme)
+                p = os.path.join(root, nme)
+                if util.own_clip(p):                        # чужие видео в этой папке не считаем и не трогаем
                     try:
                         st = os.stat(p)
                         files.append((st.st_mtime, st.st_size, p))
@@ -441,27 +504,27 @@ class Supervisor:
         if total <= cap:
             return
         tg_on = bool(self.cfg.get("tg_enabled"))
+        removed = 0
         for _mt, size, p in sorted(files):
             if total <= cap * 0.9:
                 break
             if tg_on and self.tg.queue.has_pending(p):
                 continue                                    # ещё не отправлен: не трогаем
-            try:
-                os.remove(p)
+            if util.remove_clip(p):
                 total -= size
-                txt = os.path.splitext(p)[0] + ".txt"
-                if os.path.exists(txt):
-                    os.remove(txt)
-            except OSError:
-                pass
-        self.say("Папка клипов превысила лимит: удалил самые старые")
+                removed += 1
+        if removed:
+            self.say(f"Папка клипов превысила лимит: удалил самые старые ({removed})")
 
     def _clean_candidates(self) -> None:
         d = config.subdir("candidates")
         now = time.time()
-        for p in d.glob("*.ts"):
+        for p in d.iterdir():
             try:
-                if now - p.stat().st_mtime > 3600 and not p.with_suffix(".json").exists():
+                if now - p.stat().st_mtime < 3600:
+                    continue
+                orphan_raw = p.suffix == ".ts" and not p.with_suffix(".json").exists()
+                if orphan_raw or p.name.endswith((".vr.json", ".tmp")):     # остатки прерванного монтажа
                     p.unlink()
             except OSError:
                 pass

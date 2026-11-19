@@ -11,6 +11,8 @@ import time
 from typing import Callable
 
 log = logging.getLogger("chat")
+SILENCE_PING = 30      # столько секунд тишины: спрашиваем сервер, на связи ли он
+SILENCE_DEAD = 90      # столько секунд без единого ответа: соединение мёртвое
 
 
 class ChatClient(threading.Thread):
@@ -51,9 +53,22 @@ class ChatClient(threading.Thread):
 
     def _session(self) -> None:
         raw = socket.create_connection((self.HOST, self.PORT), timeout=20)
-        sock = ssl.create_default_context().wrap_socket(raw, server_hostname=self.HOST)
+        try:
+            sock = ssl.create_default_context().wrap_socket(raw, server_hostname=self.HOST)
+        except Exception:
+            raw.close()
+            raise
         self._sock = sock
-        sock.settimeout(30)
+        try:
+            self._listen(sock)
+        finally:
+            try:
+                sock.close()
+            except OSError:
+                pass
+
+    def _listen(self, sock) -> None:
+        sock.settimeout(15)
         nick = f"justinfan{random.randint(10000, 99999)}"
         # tags: цвет ника и смайлы в каждом сообщении; commands: удаления и баны от модераторов
         sock.sendall(f"CAP REQ :twitch.tv/tags twitch.tv/commands\r\nNICK {nick}\r\nJOIN #{self.channel}\r\n".encode())
@@ -74,11 +89,13 @@ class ChatClient(threading.Thread):
                 *lines, buf = buf.split(b"\r\n")
                 for line in lines:
                     self._on_line(sock, line.decode("utf-8", "replace"), now)
-            if now - last_ping > 120:
+            # В тихом чате сообщений может не быть минутами, поэтому сами спрашиваем сервер, жив ли он.
+            # Ответа нет полторы минуты: связь оборвалась молча (роутер, смена сети, сон), переподключаемся.
+            if now - self.last_rx > SILENCE_PING and now - last_ping > SILENCE_PING:
                 sock.sendall(b"PING :sc\r\n")
                 last_ping = now
-            if now - self.last_rx > 300:
-                raise ConnectionError("чат молчит 5 минут, переподключаюсь")
+            if now - self.last_rx > SILENCE_DEAD:
+                raise ConnectionError(f"чат молчит {SILENCE_DEAD} с, переподключаюсь")
 
     def _on_line(self, sock, line: str, now: float) -> None:
         if line.startswith("PING"):

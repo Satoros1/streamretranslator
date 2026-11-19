@@ -108,14 +108,18 @@ def ai_verdict(job: dict, transcript, lo: float, hi: float, cur: tuple[float, fl
         except Exception:
             pass
         client = anthropic.Anthropic(api_key=cfg["ai_api_key"], timeout=60.0, max_retries=2)
+        # У модели размышление включено всегда и расходует тот же лимит, что и ответ. С лимитом в 2000 ответ
+        # иногда обрывался на полуслове, и описание молча заменялось обычным. Даём запас; платим только за
+        # реально написанное. Задача простая, поэтому усилие «low»: быстрее и дешевле.
         resp = client.messages.parse(
             model=cfg.get("ai_model") or "claude-haiku-5-5",
-            max_tokens=2000,
+            max_tokens=8000,
             system=SYSTEM,
             messages=[{"role": "user", "content": user}],
+            output_config={"effort": "low"},
             output_format=Verdict,
         )
-        if resp.stop_reason == "refusal" or resp.parsed_output is None:
+        if resp.stop_reason in ("refusal", "max_tokens") or resp.parsed_output is None:
             log.info("ИИ не дал ответа (%s), беру обычное описание", resp.stop_reason)
             return None
         v = resp.parsed_output

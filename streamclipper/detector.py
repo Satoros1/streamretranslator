@@ -69,6 +69,18 @@ class Detector:
     def set_words(self, pos: set[str], neg: set[str]) -> None:
         self.words_pos, self.words_neg = set(pos), set(neg)
 
+    def restart(self, now: float) -> None:
+        """Норма чата считается заново: стрим только что начался или чат долго был недоступен.
+
+        Иначе первый же наплыв зрителей в начале стрима выглядит «всплеском» на фоне почти пустого
+        чата до эфира, и программа вырезает заставку.
+        """
+        self.hist_total.clear()
+        self.hist_react.clear()
+        self.hype = None
+        self.started = now
+        self.block_until = 0.0
+
     # --- ввод ---------------------------------------------------------------
     def add_message(self, t: float, user: str, text: str) -> None:
         laugh, hype, clip = classify(text)

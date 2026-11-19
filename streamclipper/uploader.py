@@ -8,6 +8,7 @@
 from __future__ import annotations
 
 import asyncio
+import concurrent.futures
 import logging
 import os
 import sqlite3
@@ -16,10 +17,11 @@ import time
 from collections import deque
 from typing import Callable
 
-from . import config
+from . import config, util
 
 log = logging.getLogger("telegram")
 MAX_ATTEMPTS = 15
+ALERT_TTL = 2 * 3600        # уведомление, которое не удалось отправить за это время, уже никому не нужно
 
 
 class UploadQueue:
@@ -34,19 +36,25 @@ class UploadQueue:
             if "msg_id" not in cols:
                 db.execute("ALTER TABLE uploads ADD COLUMN msg_id INTEGER")
                 db.execute("ALTER TABLE uploads ADD COLUMN fb INTEGER")
+            if "chat" not in cols:
+                db.execute("ALTER TABLE uploads ADD COLUMN chat TEXT")
+        self._counts: tuple[float, dict] = (0.0, {})
 
-    def set_msg(self, id_: int, msg_id: int) -> None:
+    def set_msg(self, id_: int, msg_id: int, chat: str = "") -> None:
         with self.lock, self._db() as db:
-            db.execute("UPDATE uploads SET msg_id=? WHERE id=?", (msg_id, id_))
+            db.execute("UPDATE uploads SET msg_id=?, chat=? WHERE id=?", (msg_id, chat, id_))
 
     def set_fb(self, id_: int, fb: int | None) -> None:
         with self.lock, self._db() as db:
             db.execute("UPDATE uploads SET fb=? WHERE id=?", (fb, id_))
 
-    def recent_sent(self, days: float = 3):
+    def recent_sent(self, chat: str, days: float = 3):
+        """Недавно отправленные посты именно в этот канал. Номера постов из другого канала здесь значили бы
+        чужие сообщения (или «пост удалён»), и программа училась бы на ложных оценках."""
         with self.lock, self._db() as db:
             return db.execute("SELECT id, path, msg_id, fb FROM uploads WHERE status='sent' AND msg_id IS NOT NULL "
-                              "AND sent_at>? ORDER BY id DESC LIMIT 200", (time.time() - days * 86400,)).fetchall()
+                              "AND chat=? AND sent_at>? ORDER BY id DESC LIMIT 200",
+                              (chat, time.time() - days * 86400)).fetchall()
 
     def _db(self):
         db = sqlite3.connect(self.path, timeout=15)
@@ -71,10 +79,16 @@ class UploadQueue:
         with self.lock, self._db() as db:
             db.execute("UPDATE uploads SET next_try=? WHERE id=?", (time.time() + delay, id_))
 
-    def counts(self) -> dict:
+    def counts(self, max_age: float = 0.0) -> dict:
+        """max_age: окно программы спрашивает счётчики дважды в секунду, ему хватит ответа секундной давности."""
+        ts, cached = self._counts
+        if max_age and time.time() - ts < max_age:
+            return cached
         with self.lock, self._db() as db:
             rows = db.execute("SELECT status, COUNT(*) c FROM uploads GROUP BY status").fetchall()
-        return {r["status"]: r["c"] for r in rows}
+        out = {r["status"]: r["c"] for r in rows}
+        self._counts = (time.time(), out)
+        return out
 
     def is_sent(self, path: str) -> bool:
         with self.lock, self._db() as db:
@@ -103,7 +117,7 @@ class Telegram:
         self.status_text = "выключен"
         self.me = ""
         self.progress = ""
-        self._alerts: deque[str] = deque(maxlen=30)
+        self._alerts: deque[tuple[float, str]] = deque(maxlen=30)
         self._alert_seen: dict[str, float] = {}
         self._cfg: dict = {}
         self._loop: asyncio.AbstractEventLoop | None = None
@@ -112,6 +126,8 @@ class Telegram:
         self._restart = threading.Event()
         self._stop = threading.Event()
         self._phone_hash = None
+        self._need_password = False      # код уже принят, Telegram ждёт только облачный пароль
+        self._chat_key = ""              # канал, в который сейчас уходят клипы
         self._last_fb = 0.0
         self._thread = threading.Thread(target=self._run, daemon=True, name="telegram")
 
@@ -137,20 +153,25 @@ class Telegram:
 
     def alert(self, text: str, key: str | None = None, every: float = 1800) -> None:
         """Служебное уведомление. Одно и то же (по key) не чаще, чем раз в every секунд."""
-        if not self._cfg.get("tg_alerts", True):
-            return
+        if not self._cfg.get("tg_alerts", True) or not self._cfg.get("tg_enabled"):
+            return                       # Telegram выключен: не копим уведомления, которые некуда слать
         now = time.time()
         if key:
             if now - self._alert_seen.get(key, 0) < every:
                 return
             self._alert_seen[key] = now
-        self._alerts.append(text)
+        self._alerts.append((now, text))
 
     def call(self, coro_fn, timeout: float = 60):
         """Выполнить корутину в потоке Telegram и дождаться результата (для окна настроек)."""
         if not self._loop:
             raise RuntimeError("Telegram ещё не запущен")
-        return asyncio.run_coroutine_threadsafe(coro_fn(), self._loop).result(timeout)
+        fut = asyncio.run_coroutine_threadsafe(coro_fn(), self._loop)
+        try:
+            return fut.result(timeout)
+        except concurrent.futures.TimeoutError:
+            fut.cancel()
+            raise RuntimeError("Telegram не ответил вовремя. Проверь интернет и попробуй ещё раз") from None
 
     # --- вход по коду (режим «свой аккаунт») ------------------------------
     def request_code(self, phone: str) -> str:
@@ -159,19 +180,26 @@ class Telegram:
                 raise RuntimeError("Сначала сохрани api_id и api_hash")
             sent = await self._client.send_code_request(phone)
             self._phone_hash = (phone, sent.phone_code_hash)
+            self._need_password = False
             return "Код отправлен в Telegram"
         return self.call(go)
 
     def submit_code(self, code: str, password: str = "") -> str:
         async def go():
             from telethon import errors
+            if not self._client:
+                raise RuntimeError("Сначала нажми «Получить код»")
             phone, h = self._phone_hash or (self._cfg.get("tg_phone", ""), None)
-            try:
-                await self._client.sign_in(phone=phone, code=code.strip(), phone_code_hash=h)
-            except errors.SessionPasswordNeededError:
+            if not self._need_password:          # код уже принят: второй раз его слать нельзя, он одноразовый
+                try:
+                    await self._client.sign_in(phone=phone, code=code.strip(), phone_code_hash=h)
+                except errors.SessionPasswordNeededError:
+                    self._need_password = True
+            if self._need_password:
                 if not password:
                     return "2fa"
                 await self._client.sign_in(password=password)
+                self._need_password = False
             self._restart.set()
             return "ok"
         return self.call(go)
@@ -258,10 +286,12 @@ class Telegram:
             me = await client.get_me()
             self.me = getattr(me, "username", None) or getattr(me, "first_name", "") or ""
             self._target = None
+            self._chat_key = ""
             spec = str(cfg.get("tg_channel", "")).strip()
             if spec:
                 try:
                     self._target = await self._resolve(client, spec, bot)
+                    self._chat_key = self._peer_key(self._target, spec)
                 except Exception as e:
                     self._set("no_channel", f"канал не найден: {str(e)[:80]}")
             else:
@@ -296,12 +326,21 @@ class Telegram:
             s = "https://" + s
         return await client.get_input_entity(s)
 
+    @staticmethod
+    def _peer_key(target, spec: str) -> str:
+        """Постоянная метка канала: по ней отличаем посты этого канала от постов прежнего."""
+        try:
+            from telethon import utils
+            return str(utils.get_peer_id(target))
+        except Exception:
+            return spec.strip().lower()
+
     GOOD = set("👍❤🔥😁🤣😂👏💯⚡🏆😆🥰🤩😍")
     BAD = set("👎💩🤮😴🥱😐🤡")
 
     async def _read_feedback(self, client) -> None:
         """Оценки прямо в канале: 👍 под клипом = хороший, 👎 или удалённый пост = плохой."""
-        rows = self.queue.recent_sent()
+        rows = self.queue.recent_sent(self._chat_key)
         for i in range(0, len(rows), 90):
             part = rows[i:i + 90]
             msgs = await client.get_messages(self._target, ids=[r["msg_id"] for r in part])
@@ -329,7 +368,9 @@ class Telegram:
                 raise ConnectionError("соединение с Telegram потеряно")
             # 1) служебные уведомления
             while self._alerts:
-                text = self._alerts.popleft()
+                born, text = self._alerts.popleft()
+                if time.time() - born > ALERT_TTL:
+                    continue                                # связи не было слишком долго: новость устарела
                 try:
                     dest = str(self._cfg.get("tg_alerts_chat", "")).strip()
                     if dest:
@@ -361,7 +402,11 @@ class Telegram:
                 self.queue.mark(row["id"], "missing", "файл удалён")
                 continue
             name = os.path.basename(path)
-            size = os.path.getsize(path)
+            try:
+                size = os.path.getsize(path)
+            except OSError:
+                self.queue.mark(row["id"], "missing", "файл удалён")
+                continue
 
             def prog(sent, total, name=name):
                 self.progress = f"{name}: {100 * sent // max(total, 1)}%"
@@ -371,18 +416,14 @@ class Telegram:
                                              parse_mode=None, progress_callback=prog, part_size_kb=512)
                 self.queue.mark(row["id"], "sent")
                 try:
-                    self.queue.set_msg(row["id"], int(msg.id))
+                    self.queue.set_msg(row["id"], int(msg.id), self._chat_key)
                 except Exception:
                     pass
                 self.progress = ""
                 self._set("ok", f"подключён ({self.me})")
                 self.on_event({"t": "uploaded", "path": path, "size": size})
                 if self._cfg.get("delete_after_upload"):
-                    for p in (path, os.path.splitext(path)[0] + ".txt"):
-                        try:
-                            os.remove(p)
-                        except OSError:
-                            pass
+                    util.remove_clip(path)
             except errors.FloodWaitError as e:
                 log.warning("Telegram просит подождать %s с", e.seconds)
                 self._set("ok", f"Telegram просит подождать {e.seconds} с")

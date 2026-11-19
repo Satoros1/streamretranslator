@@ -47,8 +47,14 @@ def single_instance() -> bool:
     global _mutex, _lockfile
     if sys.platform == "win32":
         import ctypes
-        _mutex = ctypes.windll.kernel32.CreateMutexW(None, False, "StreamClipper_single_instance")
-        return ctypes.windll.kernel32.GetLastError() != 183      # ERROR_ALREADY_EXISTS
+        # Код ошибки нужно забирать тем же вызовом: отдельный GetLastError() через ctypes может вернуть чужое
+        # значение, и тогда второй экземпляр программы решит, что он первый.
+        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        kernel32.CreateMutexW.restype = ctypes.c_void_p
+        kernel32.CreateMutexW.argtypes = [ctypes.c_void_p, ctypes.c_int, ctypes.c_wchar_p]
+        ctypes.set_last_error(0)
+        _mutex = kernel32.CreateMutexW(None, 0, "StreamClipper_single_instance")
+        return ctypes.get_last_error() != 183                     # ERROR_ALREADY_EXISTS
     try:
         import fcntl
         _lockfile = open(config.data_dir() / "lock", "w")
