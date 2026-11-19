@@ -1,6 +1,6 @@
-"""Проверка вертикального клипа с чатом уже собранной программой (GitHub Actions, Windows).
+"""Проверка вертикального клипа с заголовком и чатом уже собранной программой (GitHub Actions, Windows).
 
-Делает короткое тестовое видео, просит программу собрать из него клип 1080x1920 с чатом
+Делает короткое тестовое видео, просит программу собрать из него клип 1080x1920 с заголовком над видео и чатом
 и проверяет размер кадра. Кадр из результата кладётся в папку shots, чтобы на него можно было посмотреть.
 """
 import json
@@ -27,18 +27,22 @@ def main() -> int:
              "text": texts[i % len(texts)], "emotes": [[0, 4, "25"]] if texts[i % len(texts)].startswith("Kappa") else []}
             for i in range(22)]
     # room_id: настоящий большой канал, чтобы заодно проверить загрузку смайлов 7TV/BTTV/FFZ
-    spec = {"raw": raw, "start": 1.0, "dur": 8.0, "out": out, "layout": "blur", "style": "soft", "size": "m",
-            "room_id": "71092938", "chat": chat}
+    spec = {"raw": raw, "start": 1.0, "dur": 8.0, "out": out, "layout": "big", "style": "soft", "size": "m",
+            "room_id": "71092938", "chat": chat, "headline": "угон инвалидной коляски в гта 6"}
     path = os.path.join(home, "spec.json")
     with open(path, "w", encoding="utf-8") as f:
         json.dump(spec, f, ensure_ascii=False)
     env = dict(os.environ, STREAMCLIPPER_HOME=home)
     r = subprocess.run(exe + ["vrender", path], env=env, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, timeout=600)
-    print(r.stdout.decode("utf-8", "replace")[-3000:])
+    said = r.stdout.decode("utf-8", "replace")
     log = os.path.join(home, "logs", "editor.log")
     if os.path.exists(log):
         with open(log, encoding="utf-8", errors="replace") as f:
-            print(f.read()[-3000:])
+            said += "\n" + f.read()
+    print(said[-4000:])
+    if "заголовок над видео не нарисовался" in said:
+        print("VERTICAL SMOKE: FAILED, the headline was not drawn")
+        return 1
     if r.returncode != 0 or not os.path.exists(out):
         print("VERTICAL SMOKE: FAILED, exit code", r.returncode)
         return 1

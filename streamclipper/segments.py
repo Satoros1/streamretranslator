@@ -19,6 +19,7 @@ from pathlib import Path
 SEG_RE = re.compile(r"r(\d+)_(\d+)_(\d+)\.ts$")
 LIST_RE = re.compile(r"r(\d+)_(\d+)\.csv$")
 SEG_TIME = 4
+HOLE = 0.6                    # между соседними кусочками пропало больше этого: в записи дыра (видео не успело скачаться)
 LIST_TAIL = 256 * 1024        # из списка читаем только хвост: это часы записи, буфер намного короче
 
 
@@ -86,11 +87,15 @@ def _timeline(run: int, anchor_ms: int, items: list, times: dict, whole: bool) -
                 start = anchor
             else:
                 start = st.st_mtime - SEG_TIME
-            end = max(st.st_mtime, start)
+            # Когда запись отстаёт от эфира, часы уходят далеко вперёд от видео. Кусочек не бывает намного
+            # длиннее положенного, поэтому не верим, что в нём полминуты: иначе клип из него выйдет в 2 секунды.
+            end = min(max(st.st_mtime, start), start + 1.5 * SEG_TIME)
         out.append(Segment(path, run, start, end, st.st_size))
-    # конец кусочка = начало следующего в том же прогоне: без щелей и наложений
+    # Конец кусочка = начало следующего в том же прогоне: без щелей и наложений. Но если между ними пропало
+    # видео (интернет не успел его скачать), щель остаётся: это дыра, клип через неё резать нельзя.
     for a, b in zip(out, out[1:]):
-        a.end = max(a.start, b.start)
+        if b.start - a.end <= HOLE:
+            a.end = max(a.start, b.start)
     return out
 
 
@@ -162,23 +167,33 @@ def wipe(directory: Path) -> None:
     _drop_lists(directory, None)
 
 
-def select(segs: list[Segment], start: float, end: float, anchor: float) -> tuple[list[Segment], float, float]:
-    """Подбирает кусочки для окна [start, end] и никогда не перешагивает разрыв (рекламу).
-
-    anchor: момент, который обязан попасть в клип (пик). Берётся прогон, где он лежит,
-    и окно обрезается по границам этого прогона. Возвращает (кусочки, начало, конец).
-    """
-    runs: dict[int, list[Segment]] = {}
+def pieces(segs: list[Segment]) -> list[list[Segment]]:
+    """Непрерывные отрезки записи. Внутри отрезка нет ни рекламы, ни дыр: из него можно резать клип."""
+    out: list[list[Segment]] = []
     for s in segs:
-        runs.setdefault(s.run, []).append(s)
+        if out and out[-1][-1].run == s.run and s.start - out[-1][-1].end <= HOLE:
+            out[-1].append(s)
+        else:
+            out.append([s])
+    return out
+
+
+def select(segs: list[Segment], start: float, end: float, anchor: float,
+           slack: float = 15.0) -> tuple[list[Segment], float, float]:
+    """Подбирает кусочки для окна [start, end] и никогда не перешагивает разрыв: ни рекламу, ни дыру в записи.
+
+    anchor: момент, который обязан попасть в клип (пик). Берётся непрерывный отрезок записи, где он лежит,
+    и окно обрезается по границам этого отрезка. slack: на сколько секунд отрезок может не доставать до anchor.
+    Возвращает (кусочки, начало, конец).
+    """
     best: list[Segment] | None = None
     best_dist = None
-    for rs in runs.values():
+    for rs in pieces(segs):
         lo, hi = rs[0].start, rs[-1].end
         dist = 0.0 if lo <= anchor <= hi else min(abs(anchor - lo), abs(anchor - hi))
         if best_dist is None or dist < best_dist:
             best, best_dist = rs, dist
-    if not best or (best_dist or 0) > 15:
+    if not best or (best_dist or 0) > slack:
         return [], 0.0, 0.0
     start = max(start, best[0].start)
     end = min(end, best[-1].end)

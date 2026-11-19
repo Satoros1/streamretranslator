@@ -111,3 +111,68 @@ def test_stream_arriving_in_bursts_is_recorded_whole(tmp_path):
     assert len(segs) == 6                                   # 24 секунды = шесть кусочков по 4 с, ни один не затёрт
     assert 23.0 < segs[-1].end - segs[0].start < 25.0
     assert sum(s.size for s in segs) > 0.9 * len(data)
+
+
+# --- дыры в записи: интернет не успел скачать кусок видео -----------------------
+def test_hole_in_the_recording_is_seen_and_never_inside_a_clip(tmp_path):
+    t0 = 1_800_000_000.0
+    # 12 секунд видео, потом 7 секунд пропало (streamlink не успел их скачать), потом запись идёт дальше
+    make_run(tmp_path, 1, t0, [(0.0, 4.0, t0 + 4), (4.0, 8.0, t0 + 8), (8.0, 12.0, t0 + 12),
+                               (19.0, 23.0, t0 + 23), (23.0, 27.0, t0 + 27), (27.0, 31.0, t0 + 31)])
+    segs = segments.scan(tmp_path)
+    assert round(segs[2].end - t0) == 12 and round(segs[3].start - t0) == 19      # щель осталась на месте
+    parts = segments.pieces(segs)
+    assert [len(p) for p in parts] == [3, 3]
+    chosen, start, end = segments.select(segs, t0 - 30, t0 + 60, t0 + 25)
+    assert [round(s.start - t0) for s in chosen] == [19, 23, 27]                # клип только после дыры
+    assert round(start - t0) == 19 and round(end - t0) == 31
+    chosen, start, end = segments.select(segs, t0 - 30, t0 + 60, t0 + 6)
+    assert round(start - t0) == 0 and round(end - t0) == 12                      # или только до неё
+    # момент пришёлся на саму дыру: по кнопке берём ближайшее видео, а сам по себе такой клип не нужен
+    assert segments.select(segs, t0, t0 + 60, t0 + 16, slack=15.0)[0]
+    assert segments.select(segs, t0, t0 + 60, t0 + 16, slack=2.0)[0] == []
+
+
+def test_tiny_gaps_between_pieces_are_not_holes(tmp_path):
+    t0 = 1_800_000_000.0
+    make_run(tmp_path, 1, t0, [(0.0, 3.97, t0 + 4), (4.02, 7.99, t0 + 8), (8.02, 12.0, t0 + 12)])
+    segs = segments.scan(tmp_path)
+    assert len(segments.pieces(segs)) == 1 and all(a.end == b.start for a, b in zip(segs, segs[1:]))
+    assert 0.3 <= segments.HOLE <= 1.5
+
+
+def test_lagging_recording_does_not_pretend_to_have_video(tmp_path):
+    """Запись отстала от эфира на полминуты. Кусочек, который ещё пишется, раньше «растягивался» до текущего
+    времени, и клип из него выходил в 2 секунды вместо тридцати."""
+    t0 = 1_800_000_000.0
+    make_run(tmp_path, 1, t0, [(0.0, 4.0, t0 + 4), (4.0, 8.0, t0 + 8), (8.0, 0.0, t0 + 40)], listed=2)
+    segs = segments.scan(tmp_path)
+    assert round(segs[-1].start - t0) == 8
+    assert segs[-1].end - segs[-1].start <= 1.5 * segments.SEG_TIME              # а не 32 секунды
+    assert segments.select(segs, t0, t0 + 60, t0 + 35, slack=2.0)[0] == []       # видео того момента ещё не пришло
+
+
+@pytest.mark.skipif(not shutil.which("ffmpeg"), reason="нужен ffmpeg")
+def test_real_ffmpeg_shows_the_hole(tmp_path):
+    """Настоящий ffmpeg: из потока выпало 6 секунд. В списке кусочков это должно быть видно."""
+    src = tmp_path / "src.ts"
+    enc = ["-c:v", "libx264", "-preset", "ultrafast", "-g", "60", "-keyint_min", "60", "-sc_threshold", "0", "-c:a", "aac"]
+    made = subprocess.run(["ffmpeg", "-hide_banner", "-loglevel", "error", "-f", "lavfi", "-i", "testsrc2=size=320x180:rate=30",
+                           "-f", "lavfi", "-i", "sine=frequency=440", "-t", "30", *enc, "-f", "mpegts", str(src)])
+    if made.returncode != 0:
+        pytest.skip("в этом ffmpeg нет кодировщика для тестового видео")
+    a, b = tmp_path / "a.ts", tmp_path / "b.ts"
+    cut = ["ffmpeg", "-hide_banner", "-loglevel", "error", "-y"]
+    assert subprocess.run(cut + ["-i", str(src), "-t", "12", "-c", "copy", "-copyts", "-f", "mpegts", str(a)]).returncode == 0
+    assert subprocess.run(cut + ["-ss", "18", "-i", str(src), "-c", "copy", "-copyts", "-f", "mpegts", str(b)]).returncode == 0
+    buf = tmp_path / "buf"
+    buf.mkdir()
+    ff = subprocess.Popen(recorder_cmd(buf, 1, "ts"), stdin=subprocess.PIPE)
+    ff.stdin.write(a.read_bytes() + b.read_bytes())
+    ff.stdin.close()
+    assert ff.wait(30) == 0
+    parts = segments.pieces(segments.scan(buf))
+    assert len(parts) == 2, [(round(s.start, 1), round(s.end, 1)) for p in parts for s in p]
+    gap = parts[1][0].start - parts[0][-1].end
+    assert 4.0 < gap < 9.0
+    assert 8.0 < parts[0][-1].end - parts[0][0].start < 13.0

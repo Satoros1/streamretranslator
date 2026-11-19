@@ -144,6 +144,7 @@ class Telegram:
         self.status_text = "выключен"
         self.me = ""
         self.progress = ""
+        self.votes = ""              # реакции под клипами в канале: on | off | "" (неизвестно)
         self._alerts: deque[tuple[float, str]] = deque(maxlen=30)
         self._alert_seen: dict[str, float] = {}
         self._cfg: dict = {}
@@ -261,7 +262,10 @@ class Telegram:
         else:
             out.append(("Канал для клипов", await self._try_send(
                 client, self._target, "🛠 StreamClipper\nПроверка связи: сюда будут приходить клипы ✅\n"
+                                      "Чтобы оценить клип, зажми сообщение с ним и поставь 👍 или 👎. Программа "
+                                      "учится на оценках всех подписчиков канала.\n"
                                       "Это сообщение можно удалить.")))
+            self.votes = await self._reactions_state()
         # 2) чат для служебных уведомлений
         if cfg.get("tg_alerts", True):
             dest = str(cfg.get("tg_alerts_chat", "")).strip()
@@ -293,6 +297,53 @@ class Telegram:
             if kind == "FloodWaitError":
                 return f"Telegram просит подождать {getattr(e, 'seconds', '?')} с, попробуй позже"
             return str(e)[:120] or kind
+
+    # --- оценки под клипами (реакции в канале) ------------------------------
+    VOTES = ("👍", "👎")
+
+    async def _reactions_state(self) -> str:
+        """Можно ли в канале ставить реакции под клипами: "on", "off" или "" (узнать не удалось)."""
+        client = self._client
+        if client is None or self._target is None:
+            return ""
+        try:
+            from telethon.tl import functions, types
+            full = await client(functions.channels.GetFullChannelRequest(self._target))
+            allowed = getattr(full.full_chat, "available_reactions", None)
+            if allowed is None or isinstance(allowed, types.ChatReactionsNone):
+                return "off"
+            if isinstance(allowed, types.ChatReactionsSome) and not allowed.reactions:
+                return "off"
+            return "on"
+        except Exception as e:
+            log.info("не удалось узнать, включены ли реакции в канале: %s", e)
+            return ""
+
+    def enable_reactions(self) -> str:
+        """Включает в канале реакции 👍 и 👎 (кнопка в настройках). Возвращает причину, если не вышло."""
+        return self.call(self._enable_reactions, 40)
+
+    async def _enable_reactions(self) -> str:
+        client = self._client
+        if client is None or self._target is None:
+            return "Telegram ещё не подключён или канал не выбран"
+        try:
+            from telethon.tl import functions, types
+            await client(functions.messages.SetChatAvailableReactionsRequest(
+                peer=self._target,
+                available_reactions=types.ChatReactionsSome(
+                    reactions=[types.ReactionEmoji(emoticon=e) for e in self.VOTES])))
+        except Exception as e:
+            kind = type(e).__name__
+            if kind != "ChatNotModifiedError":           # «уже так и есть» ошибкой не считаем
+                if kind in ("ChatAdminRequiredError", "ChatWriteForbiddenError", "RightForbiddenError"):
+                    return ("нет прав менять настройки канала. Включи сам: канал → Изменить → Реакции, "
+                            "или дай этому аккаунту право менять информацию о канале")
+                if kind == "FloodWaitError":
+                    return f"Telegram просит подождать {getattr(e, 'seconds', '?')} с, попробуй позже"
+                return str(e)[:120] or kind
+        self.votes = await self._reactions_state() or "on"
+        return ""
 
     def logout(self) -> None:
         async def go():
@@ -326,6 +377,7 @@ class Telegram:
     async def _session(self) -> None:
         cfg = self._cfg
         self._client = None
+        self.votes = ""
         if not cfg.get("tg_enabled"):
             self._set("off", "выключен")
             await self._wait_restart()
@@ -376,6 +428,7 @@ class Telegram:
                 self._set("no_channel", "не выбран канал")
             if self._target is not None:
                 self._set("ok", f"подключён ({self.me})")
+                self.votes = await self._reactions_state()
             await self._work(client, errors, bot)
         finally:
             try:

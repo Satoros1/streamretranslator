@@ -55,7 +55,10 @@ DEFAULTS: dict = {
     "sensitivity": 3,           # 1 (только самый жир) .. 5 (берём почти всё)
     "min_score": 0,             # не сохранять клипы с оценкой ниже
     "clip_format": "tiktok",    # tiktok: вертикальный 1080x1920; original: как на стриме; both: оба файла
-    "tt_layout": "blur",        # blur: видео целиком, фон размыт; crop: на весь экран, края обрезаны
+    "tt_layout": "big",         # big: крупно, как в TikTok-нарезках; blur: видео целиком, фон размыт; crop: на весь экран
+    "tt_title": True,           # крупная надпись над видео
+    "tt_title_text": "",        # своя надпись на каждый клип; пусто = программа придумывает сама
+    "look": 0,                  # какой вид клипа уже предложен этому компьютеру (см. load)
     "chat_style": "soft",       # чат в вертикальном клипе: off, text, soft, solid
     "chat_size": "m",           # s, m, l
     "chat_hide": "",            # слова через запятую: сообщения с ними в клип не попадают
@@ -67,6 +70,7 @@ DEFAULTS: dict = {
     "ai_enabled": False,
     "ai_api_key": "",
     "ai_model": "claude-haiku-5-5",
+    "ai_frames": True,          # показывать ИИ кадры из клипа: заголовок получается о том, что на экране
     "ai_filter": False,         # позволить ИИ отбраковывать несмешное
     # telegram
     "tg_enabled": False,
@@ -109,6 +113,12 @@ def load() -> dict:
             pass
     if not cfg["clips_dir"]:
         cfg["clips_dir"] = default_clips_dir()
+    if int(cfg.get("look") or 0) < 1:
+        # Вид «крупно, с заголовком» стал основным. У кого стоял прежний основной вид, тот получает новый;
+        # после этого выбор в настройках больше не трогаем.
+        if cfg.get("tt_layout") == "blur":
+            cfg["tt_layout"] = "big"
+        cfg["look"] = 1
     return cfg
 
 

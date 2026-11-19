@@ -4,6 +4,10 @@
 обычно (медиана за последние 10 минут), и ловим всплеск относительно ЭТОЙ нормы.
 Срабатывание засчитывается только когда чат именно смеётся/орёт, а не спамит командами.
 Событие выдаётся ПОСЛЕ того, как движ закончился, чтобы взять момент целиком.
+
+Большой чат посмеивается постоянно, и каждый смешок выше нормы. Поэтому всплеск ещё и сравнивается
+с собственными всплесками этого канала за последние полтора часа: клипом становится только то, что входит
+в самые сильные минуты, держится несколько секунд и идёт от многих зрителей, а не от пары спамеров.
 """
 from __future__ import annotations
 
@@ -24,6 +28,15 @@ REFRACTORY = 25       # после события не срабатываем: �
 
 #           z реакций, минимум реакций за окно, z общего потока
 SENS = {1: (8.0, 16, 4.0), 2: (6.0, 12, 3.2), 3: (4.5, 8, 2.5), 4: (3.4, 6, 2.0), 5: (2.6, 4, 1.6)}
+# Всплеск должен быть сильнее такой доли минут за последние полтора часа. 0.92 = входит в 8% самых сильных
+# минут, то есть не больше примерно пяти клипов в час с одного канала. 0 = не сравнивать.
+RARE = {1: 0.97, 2: 0.95, 3: 0.92, 4: 0.80, 5: 0.0}
+RARE_HISTORY = 90     # по скольким минутам судим, что для канала «сильно»
+RARE_MIN = 15         # пока минут наблюдения меньше, сравнивать не с чем: берём только заметно сильные всплески
+EARLY = 3.0           # во сколько раз строже порог, пока сравнивать не с чем
+MIN_DUR = 8.0         # реакция короче этого = чат «чуть посмеялся»
+MIN_USERS = 6         # реагировало меньше зрителей = это не чат, а пара человек
+MIN_UNIQ = 0.4        # доля разных зрителей среди сообщений; ниже = спам одних и тех же
 
 
 @dataclass
@@ -57,6 +70,11 @@ class Detector:
         self.started: float | None = None
         self.hype: dict | None = None
         self.block_until = 0.0
+        # самые сильные реакции по минутам: с ними сравнивается каждый новый всплеск
+        self.minute_peaks: deque[tuple[int, float]] = deque(maxlen=RARE_HISTORY)
+        self._minute: tuple[int, float] | None = None
+        self.skipped: Counter = Counter()     # сколько всплесков отсеяно и почему (для журнала и «библии»)
+        self.last_skip = ""
         # для интерфейса
         self.rate = 0.0
         self.level = 0.0
@@ -65,6 +83,7 @@ class Detector:
         """mult: поправка, выученная для канала (больше 1 = строже, меньше 1 = чувствительнее)."""
         zr, mr, zt = SENS.get(int(s), SENS[3])
         self.z_react, self.min_react, self.z_total = zr * mult, max(3, round(mr * mult)), zt * mult
+        self.rare = RARE.get(int(s), RARE[3])
 
     def set_words(self, pos: set[str], neg: set[str]) -> None:
         self.words_pos, self.words_neg = set(pos), set(neg)
@@ -77,6 +96,8 @@ class Detector:
         """
         self.hist_total.clear()
         self.hist_react.clear()
+        self.minute_peaks.clear()
+        self._minute = None
         self.hype = None
         self.started = now
         self.block_until = 0.0
@@ -114,6 +135,8 @@ class Detector:
         if cur - self.last_sec > 120:        # ноутбук спал: начинаем учиться заново
             self.hist_total.clear()
             self.hist_react.clear()
+            self.minute_peaks.clear()
+            self._minute = None
             self.hype = None
             self.started = now
             self.last_sec = cur - 1
@@ -126,6 +149,34 @@ class Detector:
         for k in [k for k in self.bins if k < cur - 240]:
             del self.bins[k]
         return ev
+
+    def rare_bar(self, before: float) -> float | None:
+        """Какой силы реакцию (сообщений-реакций в секунду) надо превзойти, чтобы попасть в самые сильные минуты.
+        before: минуты начиная с этой секунды не считаются, в них сам проверяемый всплеск. None: судить рано."""
+        if not self.rare:
+            return None
+        vals = sorted(v for (m, v) in self.minute_peaks if m < int(before) // 60)
+        if len(vals) < RARE_MIN:
+            return None
+        return vals[min(len(vals) - 1, max(0, math.ceil(self.rare * len(vals)) - 1))]
+
+    def _too_weak(self, h: dict) -> str:
+        """Почему всплеск не дотягивает до клипа. Пустая строка: дотягивает."""
+        if not self.rare:
+            return ""
+        bar = self.rare_bar(h["onset"])
+        if bar is None:
+            if h["peak_z"] < self.z_react * EARLY:
+                return "для первых минут наблюдения реакция слабовата"
+            return ""
+        if h["peak_rate"] <= bar:
+            return f"у этого чата бывает сильнее ({h['peak_rate']:.1f} реакции/с при планке {bar:.1f})"
+        return ""
+
+    def _skip(self, why: str) -> None:
+        self.skipped[why.split(" (")[0]] += 1
+        self.last_skip = why
+        return None
 
     def _window(self, s: int) -> tuple[float, float, float, float]:
         tot = rea = lau = hyp = 0.0
@@ -155,6 +206,13 @@ class Detector:
         share = rea5 / tot5 if tot5 else 0.0
         self.rate = total_rate
         self.level = max(0.0, min(1.0, z_r / (self.z_react * 1.5)))
+        minute = s // 60
+        if self._minute is None or self._minute[0] != minute:
+            if self._minute is not None:
+                self.minute_peaks.append(self._minute)
+            self._minute = (minute, react_rate)
+        elif react_rate > self._minute[1]:
+            self._minute = (minute, react_rate)
 
         if self.hype is None:
             self.hist_total.append(total_rate)
@@ -182,9 +240,11 @@ class Detector:
             return None
 
         self.hype = None
-        self.block_until = s + REFRACTORY
         onset, end = h["onset"], h["last_hot"] - WINDOW / 2 + 1
         end = max(end, h["peak"] + 1)
+        why = self._too_weak(h)
+        if why:
+            return self._skip(why)
         chat = [(t, u, x) for (t, u, x) in self.msgs if onset - 45 <= t <= end + 5]
         inside = [x for (t, _u, x) in chat if onset - 1 <= t <= end + 2]
         counts = Counter(normalize(x) for x in inside if x and x[0] not in "!/")
@@ -201,6 +261,12 @@ class Detector:
                 clipreq += 1 if classify(x)[2] else 0
                 learned += 1 if tk & self.words_pos else 0
         n_in = max(1, len(inside))
+        if self.rare:                                    # на самой высокой чувствительности берём всё подряд
+            if end - onset < MIN_DUR:
+                return self._skip("чат отреагировал слишком коротко")
+            if len(users) < MIN_USERS or len(users) / n_in < MIN_UNIQ:
+                return self._skip("реагировало слишком мало зрителей")
+        self.block_until = s + REFRACTORY
         spikes = []
         for tok, n in tok_cnt.most_common(40):
             if n < max(4, 0.04 * n_in):
