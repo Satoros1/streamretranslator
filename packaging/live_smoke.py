@@ -82,8 +82,12 @@ def main() -> int:
         for i, p in enumerate(tall[:3]):                    # кадры из вертикальных клипов: посмотреть чат на настоящем стриме
             subprocess.run(["ffmpeg", "-hide_banner", "-loglevel", "error", "-y", "-ss", "20", "-i", p, "-frames:v", "1",
                             "-vf", "scale=540:-2", os.path.join(out, "live_vertical_%d.jpg" % i)])
-    print("LIVE SMOKE:", "PASSED, clips: %d" % len(found) if found else "NO CLIPS")
-    return 0 if found else 1
+    made = sorted({os.path.basename(os.path.dirname(os.path.dirname(p))) for p in found})
+    missing = [c for c in channels if c.lower() not in made]
+    print("channels with clips: %d of %d" % (len(made), len(channels)), "| without:", missing or "none")
+    good = bool(found) and len(missing) <= 1               # один канал мог как раз уйти на рекламу или закончить стрим
+    print("LIVE SMOKE:", "PASSED, clips: %d" % len(found) if good else "FAILED, clips: %d" % len(found))
+    return 0 if good else 1
 
 
 if __name__ == "__main__":

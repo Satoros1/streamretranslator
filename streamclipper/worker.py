@@ -22,7 +22,7 @@ import time
 import uuid
 from pathlib import Path
 
-from . import config, segments, util
+from . import config, mp4stream, segments, util
 from .chat import ChatClient
 from .detector import Detector, Event
 from .learning import Learner, learnable, tokenize
@@ -34,6 +34,7 @@ PRE_ROLL = 45         # сколько секунд до реакции чата
 POST_ROLL = 8
 MAX_RAW = 170
 CHAT_KEEP = 300       # сколько секунд чата помнить для показа поверх клипа
+STALL = 50            # видео идёт, а новых кусков на диске нет столько секунд = запись сломалась
 
 
 class Worker:
@@ -158,10 +159,11 @@ class Worker:
         log.info("качества стрима: %s; беру %s (%s)", ", ".join(streams), name, type(streams[name]).__name__)
         return streams[name].open()
 
-    def _start_ffmpeg(self) -> subprocess.Popen:
+    def _start_ffmpeg(self, kind: str = "ts") -> subprocess.Popen:
         self.run_no += 1
+        fmt = {"ts": ["-f", "mpegts"], "mp4": ["-f", "mov"]}.get(kind, [])       # неизвестный вид ffmpeg определит сам
         cmd = [util.find_tool("ffmpeg"), "-hide_banner", "-loglevel", "error", "-fflags", "+genpts+discardcorrupt",
-               "-f", "mpegts", "-i", "pipe:0", "-map", "0:v:0?", "-map", "0:a:0?", "-c", "copy",
+               *fmt, "-i", "pipe:0", "-map", "0:v:0?", "-map", "0:a:0?", "-c", "copy",
                "-f", "segment", "-segment_time", str(segments.SEG_TIME), "-segment_format", "mpegts",
                "-strftime", "1", "-reset_timestamps", "0", segments.seg_pattern(self.buf_dir, self.run_no)]
         err = tempfile.TemporaryFile()
@@ -187,8 +189,10 @@ class Worker:
             try:
                 err.seek(0)
                 text = err.read().decode("utf-8", "replace").strip()
-                if text or ff.returncode not in (0, None):
+                if ff.returncode not in (0, None):
                     log.warning("ffmpeg записи завершился с кодом %s: %s", ff.returncode, text[-500:] or "без сообщений")
+                elif text:                               # обычное дело при обрыве: последний кусок пришёл не целиком
+                    log.info("ffmpeg записи: %s", text[-300:])
             except (OSError, ValueError):
                 pass
             finally:
@@ -213,16 +217,32 @@ class Worker:
         ff = None
         last = time.time()
         got, report_at, t_open = 0, time.time() + 25, time.time()
+        health_at, got_mark, flowing_since = time.time() + 15, 0, time.time()
+        kind: str | None = None                          # вид потока: Twitch отдаёт либо MPEG-TS, либо fMP4
+        boxes: mp4stream.Mp4Boxes | None = None
+        ftyp, init = b"", b""
         dump = None
         if os.environ.get("STREAMCLIPPER_DUMP"):         # для проверки: первые мегабайты потока как есть
             dump = open(config.subdir("logs") / f"dump_{self.channel}.bin", "wb")
         try:
             while not self.stop.is_set() and not self.cfg.get("paused"):
-                if time.time() >= report_at:
+                now = time.time()
+                if now >= report_at:
                     segs = segments.scan(self.buf_dir)
-                    log.info("за %d с получено %.1f МБ видео, на диске %d кусков (%.1f МБ)", time.time() - t_open,
+                    log.info("за %d с получено %.1f МБ видео, на диске %d кусков (%.1f МБ)", now - t_open,
                              got / 1e6, len(segs), sum(os.path.getsize(x.path) for x in segs if os.path.exists(x.path)) / 1e6)
-                    report_at = time.time() + (60 if time.time() - t_open < 200 else 900)
+                    report_at = now + (60 if now - t_open < 200 else 900)
+                if now >= health_at:                     # видео приходит, а на диск не ложится: так молчать нельзя
+                    health_at = now + 15
+                    segs = segments.scan(self.buf_dir)
+                    fresh = bool(segs) and segs[-1].start > now - STALL
+                    if got - got_mark > 2_000_000 and not fresh and now - flowing_since > STALL:
+                        log.warning("видео приходит (%.1f МБ), но на диск не пишется: переподключаюсь", (got - got_mark) / 1e6)
+                        self.state, self.detail = "error", "видео приходит, но не записывается. Переподключаюсь"
+                        break
+                    if got == got_mark:
+                        flowing_since = now              # данных не было (реклама, пауза): отсчёт заново
+                    got_mark = got
                 try:
                     chunk = q.get(timeout=1.0)
                 except queue.Empty:
@@ -242,16 +262,47 @@ class Worker:
                     if dump.tell() > 6_000_000:
                         dump.close()
                         dump = None
-                if ff is None or ff.poll() is not None:
-                    self._close_ffmpeg(ff)
-                    ff = self._start_ffmpeg()
+                if kind is None:
+                    kind = mp4stream.sniff(chunk)
+                    boxes = mp4stream.Mp4Boxes() if kind == "mp4" else None
+                    log.info("вид потока: %s", {"mp4": "fMP4", "ts": "MPEG-TS"}.get(kind, "не распознан"))
                 self.state = "live"
-                try:
-                    ff.stdin.write(chunk)
-                except OSError:
-                    self._close_ffmpeg(ff)
-                    ff = None
                 last = time.time()
+                if boxes is None:                        # MPEG-TS: можно писать с любого места
+                    if ff is None or ff.poll() is not None:
+                        self._close_ffmpeg(ff)
+                        ff = self._start_ffmpeg(kind)
+                    try:
+                        ff.stdin.write(chunk)
+                    except OSError:
+                        self._close_ffmpeg(ff)
+                        ff = None
+                    continue
+                for box, piece, is_start in boxes.feed(chunk):
+                    if box in mp4stream.WHOLE:           # заголовок: запоминаем и отдаём каждому новому ffmpeg
+                        if box == b"ftyp":
+                            ftyp = piece
+                            continue
+                        fresh = ftyp + piece
+                        if fresh != init:
+                            if init and ff:              # параметры видео поменялись на ходу: начинаем новый кусок записи
+                                self._close_ffmpeg(ff)
+                                ff = None
+                            init = fresh
+                        continue
+                    if ff is not None and ff.poll() is not None:
+                        self._close_ffmpeg(ff)
+                        ff = None
+                    if ff is None:
+                        if not init or not is_start or box == b"mdat":
+                            continue                     # ждём границы следующего куска видео
+                        ff = self._start_ffmpeg(kind)
+                        piece = init + piece
+                    try:
+                        ff.stdin.write(piece)
+                    except OSError:
+                        self._close_ffmpeg(ff)
+                        ff = None
         finally:
             self._close_ffmpeg(ff)
             if dump is not None:
