@@ -7,6 +7,8 @@ import time
 from . import config, util
 from .supervisor import Supervisor
 
+DRAIN = 420           # сколько секунд после остановки записи ждём, пока домонтируются пойманные моменты
+
 
 def main(argv: list[str]) -> int:
     util.setup_logging("app", console=True)
@@ -35,13 +37,29 @@ def main(argv: list[str]) -> int:
                     sup.clip_now(s["name"])
     except KeyboardInterrupt:
         pass
-    time.sleep(14)
-    while not sup.edit_q.empty() or sup.editing:
-        time.sleep(1)
+    try:
+        time.sleep(14)
+        # Запись останавливаем до того, как ждать монтаж: в разгар вечера новые моменты приходят быстрее,
+        # чем монтируются старые, и такое ожидание не кончалось бы никогда.
+        sup.stop_recording()
+        drain_until = time.time() + DRAIN
+        while sup.edit_q.busy() and time.time() < drain_until:
+            time.sleep(1)
+    except KeyboardInterrupt:
+        pass
+    if sup.edit_q.busy():
+        print("UNFINISHED EDITS: %d" % (sup.edit_q.qsize() + (1 if sup.edit_q.active() else 0)), flush=True)
+    sup.shutdown()
+    try:
+        time.sleep(1.5)
+        wait_until = time.time() + 240
+        while sup.edit_q.active() and time.time() < wait_until:    # начатый клип даём домонтировать, новых уже не будет
+            time.sleep(1)
+    except KeyboardInterrupt:
+        pass
     while True:
         try:
             print(sup.events.get_nowait(), flush=True)
         except queue.Empty:
             break
-    sup.shutdown()
     return 0

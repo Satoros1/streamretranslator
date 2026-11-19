@@ -6,6 +6,7 @@
 from __future__ import annotations
 
 import glob
+import heapq
 import json
 import logging
 import os
@@ -23,6 +24,7 @@ from .uploader import Telegram
 log = logging.getLogger("supervisor")
 
 HANG_SECONDS = 90
+EDIT_BACKLOG = 12     # столько моментов может ждать монтажа; когда их больше, самые слабые пропускаются
 STATE_RU = {
     "starting": "запускается", "offline": "не в эфире", "live": "идёт запись", "ad": "реклама, пропускаю",
     "pause": "нет данных, жду", "error": "ошибка", "paused": "пауза", "restarting": "перезапуск",
@@ -45,6 +47,82 @@ class WorkerHandle:
         self.live_since = 0.0
 
 
+class EditQueue:
+    """Очередь монтажа. Монтаж идёт по одному клипу, а моменты приходят сразу с нескольких стримов,
+    и вечером, когда чат бурлит везде, их бывает больше, чем компьютер успевает смонтировать.
+
+    Поэтому порядок такой: сначала клипы, которые попросили вручную, потом самые сильные моменты.
+    И очередь не растёт без конца: когда ждёт больше `limit` заготовок, самая слабая пропускается.
+    Иначе клипы приходили бы с опозданием на часы, а заготовки копились бы на диске.
+    """
+
+    def __init__(self, limit: int = EDIT_BACKLOG):
+        self.limit = limit
+        self._cv = threading.Condition()
+        self._heap: list[tuple[int, int, int, str]] = []    # (0 ручной / 1 авто, минус оценка, номер по порядку, файл)
+        self._seq = 0
+        self._active = 0
+
+    def put(self, job: str, score: int = 0, manual: bool = False) -> list[tuple[str, int]]:
+        """Ставит заготовку в очередь. Возвращает вытесненные из очереди: [(файл, оценка)]."""
+        dropped = []
+        with self._cv:
+            self._seq += 1
+            heapq.heappush(self._heap, (0 if manual else 1, -int(score), self._seq, job))
+            while len(self._heap) > self.limit:
+                auto = [it for it in self._heap if it[0] == 1]
+                if not auto:
+                    break                                   # ручные клипы не выбрасываем никогда
+                worst = max(auto, key=lambda it: (it[1], -it[2]))   # ниже всех оценка, из равных самый старый
+                self._heap.remove(worst)
+                heapq.heapify(self._heap)
+                dropped.append((worst[3], -worst[1]))
+            self._cv.notify()
+        return dropped
+
+    def get(self, timeout: float) -> tuple[str, int, bool]:
+        """Лучшая заготовка: (файл, оценка, ручной ли клип). После монтажа обязательно вызвать done()."""
+        with self._cv:
+            if not self._heap:
+                self._cv.wait(timeout)
+            if not self._heap:
+                raise queue.Empty
+            manual, neg, _n, job = heapq.heappop(self._heap)
+            self._active += 1
+            return job, -neg, manual == 0
+
+    def done(self) -> None:
+        with self._cv:
+            self._active = max(0, self._active - 1)
+
+    def qsize(self) -> int:
+        with self._cv:
+            return len(self._heap)
+
+    def empty(self) -> bool:
+        return self.qsize() == 0
+
+    def active(self) -> bool:
+        """Монтируется ли клип прямо сейчас."""
+        with self._cv:
+            return self._active > 0
+
+    def busy(self) -> bool:
+        """Есть ли ещё работа: заготовки в очереди или клип, который монтируется прямо сейчас."""
+        with self._cv:
+            return bool(self._heap) or self._active > 0
+
+
+def job_rank(job: str) -> tuple[int, bool]:
+    """Оценка и вид заготовки из её файла: (оценка, ручной ли клип). Нужна для заготовок с прошлого запуска."""
+    try:
+        with open(job, "r", encoding="utf-8") as f:
+            d = json.load(f)
+        return int(d.get("score") or 0), d.get("kind") == "manual"
+    except (OSError, ValueError, TypeError, AttributeError):
+        return 0, False
+
+
 class Supervisor:
     def __init__(self):
         self.cfg = config.load()
@@ -52,9 +130,11 @@ class Supervisor:
         self.workers: dict[str, WorkerHandle] = {}
         self.lock = threading.RLock()
         self.stop = threading.Event()
-        self.edit_q: queue.Queue = queue.Queue()
+        self.edit_q = EditQueue()
         self.edit_fail: dict[str, int] = {}
         self.editing = ""
+        self.recording_off = False                      # запись остановлена, идёт только монтаж пойманного
+        self._drop_hint = 0.0
         self.tg = Telegram(self._on_tg)
         self.learner = Learner()
         self.stats = self._load_stats()
@@ -148,7 +228,7 @@ class Supervisor:
                 except OSError:
                     pass
                 continue
-            self.edit_q.put(job)                        # недоделанное с прошлого запуска
+            self._enqueue(job, *job_rank(job))          # недоделанное с прошлого запуска
         self.tg.start(self.cfg)
         system.prevent_sleep(bool(self.cfg.get("prevent_sleep")))
         for target, name in ((self._monitor_loop, "monitor"), (self._edit_loop, "editor"),
@@ -202,7 +282,7 @@ class Supervisor:
                 elif t == "candidate":
                     self.say(f"{h.name}: пойман момент" + (f" (оценка {msg['score']})" if msg.get("score") else "")
                              + ", монтирую…")
-                    self.edit_q.put(msg["job"])
+                    self._enqueue(msg["job"], msg.get("score") or 0, msg.get("kind") == "manual")
                 elif t == "event":
                     k = msg.get("kind")
                     if k == "online":
@@ -269,8 +349,18 @@ class Supervisor:
                     except Exception:
                         log.exception("monitor %s", h.name)
 
+    def stop_recording(self) -> None:
+        """Останавливает запись всех каналов, а монтаж уже пойманных моментов продолжается.
+        Нужно проверочному запуску: иначе новые моменты приходят быстрее, чем кончается очередь."""
+        self.recording_off = True
+        with self.lock:
+            handles = list(self.workers.values())
+            self._stop_all(handles)
+            for h in handles:
+                h.status = {"state": "stopped"}
+
     def _check(self, h: WorkerHandle, now: float) -> None:
-        if self.stop.is_set():
+        if self.stop.is_set() or self.recording_off:
             return                                      # программа закрывается: никого не перезапускаем
         if h.proc is None:
             if now >= h.next_start:
@@ -379,36 +469,62 @@ class Supervisor:
         return out
 
     # --- монтаж -----------------------------------------------------------
+    def _enqueue(self, job: str, score: int = 0, manual: bool = False) -> None:
+        """Ставит заготовку на монтаж. Если очередь переполнена, самые слабые моменты из неё пропускаются."""
+        try:
+            score = int(score or 0)
+        except (TypeError, ValueError):
+            score = 0
+        for lost, lost_score in self.edit_q.put(job, score, manual):
+            self._drop_job(lost)
+            self.edit_fail.pop(lost, None)
+            ch = os.path.basename(lost).rsplit("_", 3)[0]
+            text = f"Монтаж не успевает за стримами: самый слабый момент пропущен ({ch}, оценка {lost_score})"
+            now = time.time()
+            if now - self._drop_hint > 1800:            # совет показываем изредка, чтобы не засорять журнал
+                self._drop_hint = now
+                text += ". Если так бывает часто, понизь чувствительность в настройках"
+            self.say(text)
+
     def _edit_loop(self) -> None:
         while not self.stop.is_set():
             try:
-                job = self.edit_q.get(timeout=1)
+                job, score, manual = self.edit_q.get(timeout=1)
             except queue.Empty:
                 continue
-            if not os.path.exists(job):
-                continue
-            if self.low_disk:
-                self.say("Мало места на диске: клип пропущен", "error")
-                self._drop_job(job)
-                continue
-            self.editing = os.path.basename(job)
-            env = dict(os.environ, PYTHONIOENCODING="utf-8", PYTHONUTF8="1")
-            if self.edit_fail.get(job):
-                # Первая попытка не удалась. Чаще всего виновато распознавание речи (нет памяти, зависла загрузка
-                # модели, сбой библиотеки), поэтому вторая идёт без него и без ИИ: клип важнее описания.
-                env["STREAMCLIPPER_SAFE_EDIT"] = "1"
             try:
-                r = subprocess.run(util.worker_cmd("edit", job), stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
-                                   stderr=subprocess.DEVNULL, timeout=1500,
-                                   creationflags=util.NO_WINDOW | util.LOW_PRIORITY, env=env)
-                lines = r.stdout.decode("utf-8", "replace").strip().splitlines()
-                res = json.loads(lines[-1]) if lines else {"ok": False, "error": "монтажёр ничего не ответил"}
-            except subprocess.TimeoutExpired:
-                res = {"ok": False, "error": "монтаж шёл дольше 25 минут"}
-            except Exception as e:
-                res = {"ok": False, "error": str(e)[:200]}
-            self.editing = ""
-            self._edit_done(job, res)
+                self._edit_one(job, score, manual)
+            except Exception:
+                log.exception("монтаж %s", job)
+            finally:
+                self.editing = ""
+                self.edit_q.done()
+
+    def _edit_one(self, job: str, score: int, manual: bool) -> None:
+        if not os.path.exists(job):
+            return
+        if self.low_disk:
+            self.say("Мало места на диске: клип пропущен", "error")
+            self._drop_job(job)
+            return
+        self.editing = os.path.basename(job)
+        env = dict(os.environ, PYTHONIOENCODING="utf-8", PYTHONUTF8="1")
+        if self.edit_fail.get(job):
+            # Первая попытка не удалась. Чаще всего виновато распознавание речи (нет памяти, зависла загрузка
+            # модели, сбой библиотеки), поэтому вторая идёт без него и без ИИ: клип важнее описания.
+            env["STREAMCLIPPER_SAFE_EDIT"] = "1"
+        try:
+            r = subprocess.run(util.worker_cmd("edit", job), stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+                               stderr=subprocess.DEVNULL, timeout=1500,
+                               creationflags=util.NO_WINDOW | util.LOW_PRIORITY, env=env)
+            lines = r.stdout.decode("utf-8", "replace").strip().splitlines()
+            res = json.loads(lines[-1]) if lines else {"ok": False, "error": "монтажёр ничего не ответил"}
+        except subprocess.TimeoutExpired:
+            res = {"ok": False, "error": "монтаж шёл дольше 25 минут"}
+        except Exception as e:
+            res = {"ok": False, "error": str(e)[:200]}
+        self.editing = ""
+        self._edit_done(job, res, score, manual)
 
     def _drop_job(self, job: str) -> None:
         for p in (job, job[:-5] + ".ts"):
@@ -416,14 +532,18 @@ class Supervisor:
                 os.remove(p)
             except OSError:
                 pass
+        try:                                            # момент не стал клипом: в списке клипов он не нужен
+            self.learner.drop("_".join(os.path.basename(job)[:-5].rsplit("_", 3)[1:]))
+        except Exception:
+            log.exception("не убрал пропущенный момент из базы обучения")
 
-    def _edit_done(self, job: str, res: dict) -> None:
+    def _edit_done(self, job: str, res: dict, score: int = 0, manual: bool = False) -> None:
         if not res.get("ok"):
             n = self.edit_fail.get(job, 0) + 1
             self.edit_fail[job] = n
             if n < 2 and not res.get("fatal"):
                 self.say(f"Монтаж не удался ({res.get('error')}), пробую ещё раз", "error")
-                self.edit_q.put(job)
+                self._enqueue(job, score, manual)
             else:
                 self.say(f"Клип не получился: {res.get('error')}", "error")
                 self._drop_job(job)
