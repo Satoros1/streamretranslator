@@ -24,7 +24,7 @@ from pathlib import Path
 
 from . import config, mp4stream, netmeter, segments, util
 from .chat import ChatClient
-from .detector import WARMUP, Detector, Event
+from .detector import WARMUP, Detector, Event, strength
 from .learning import Learner, learnable, tokenize
 
 log = logging.getLogger("worker")
@@ -97,6 +97,18 @@ class Worker:
             self.det.set_words(*self.learner.channel_words(self.channel))
         except Exception:
             log.exception("не смог применить обучение")
+
+    def _reload(self) -> None:
+        """Настройки или выученное поменялись: подхватываем на ходу, запись не прерывается."""
+        self.cfg = config.load()
+        with self.det_lock:
+            self._apply_learning()
+        if self.auto_cap and self.auto_cap[0] < netmeter.floor_of(self.cfg):
+            # В настройках подняли «не опускать ниже», а запись уже снизила себя сильнее: возвращаемся наверх.
+            self.auto_cap = None
+            if self.pump_beat:
+                self._reopen = True
+                log.info("качество записи было снижено сильнее, чем теперь разрешено: открываю стрим заново")
 
     # --- связь с главным процессом ---------------------------------------
     def emit(self, **msg) -> None:
@@ -201,15 +213,21 @@ class Worker:
         return src
 
     def _lower_quality(self, load: float, speed: float) -> bool:
-        """Интернет не успевает за стримом: выбирает качество полегче. True: стрим надо переоткрыть."""
-        new = netmeter.lower(self.variants, self.quality, speed)
+        """Интернет не успевает за стримом: выбирает качество полегче. True: стрим надо переоткрыть.
+
+        Ниже качества из настройки «не опускать ниже» запись себя не снижает: мутный клип никому не нужен.
+        Если интернета не хватает и на него, человек узнаёт об этом и решает сам (обычно убирает стрим)."""
+        floor = netmeter.floor_of(self.cfg)
+        new = netmeter.lower(self.variants, self.quality, speed, floor)
         now = time.time()
         if new is None:
-            if now - self._slow_said > 900:              # ниже некуда: говорим об этом, но изредка
+            if now - self._slow_said > 900:              # ниже некуда или нельзя: говорим об этом, но изредка
                 self._slow_said = now
-                log.warning("интернет не успевает даже за самым низким качеством %s (кусочки качаются в %.1f раза "
-                            "дольше, чем длятся)", self.quality, load)
-                self.emit(t="event", kind="slow_net", old=self.quality, new="")
+                held = floor if netmeter.lower(self.variants, self.quality, speed) else 0     # ниже есть, но нельзя
+                log.warning("интернет не успевает за качеством %s (кусочки качаются в %.1f раза дольше, чем длятся), "
+                            "%s", self.quality, load,
+                            f"а ниже {held}p качество не опускается" if held else "а ниже качества у стрима нет")
+                self.emit(t="event", kind="slow_net", old=self.quality, new="", floor=held)
             return False
         old = self.quality
         self.auto_cap = new[:2]
@@ -313,6 +331,8 @@ class Worker:
             while not self.stop.is_set() and not self.cfg.get("paused"):
                 now = time.time()
                 self.pump_beat = now
+                if self._reopen:                         # качество поменяли в настройках: стрим открывается заново
+                    break
                 if now >= report_at:
                     segs = segments.scan(self.buf_dir)
                     log.info("за %d с получено %.1f МБ видео, на диске %d кусков (%.1f МБ)", now - t_open,
@@ -558,7 +578,8 @@ class Worker:
                 learned = self.learner.predict(self.channel, ev.features, ev.score)
                 self.learner.record(cid, self.channel, ev.kind, ev.features, ev.tokens, ev.score, learned)
                 job.update(onset=ev.onset - raw_start, peak=ev.peak - raw_start, end=ev.end - raw_start,
-                           score=learned, base_score=ev.score, peak_z=ev.peak_z, share=ev.share, messages=ev.messages, top=ev.top,
+                           score=learned, base_score=ev.score, rank=strength(ev, learned),
+                           peak_z=ev.peak_z, share=ev.share, messages=ev.messages, top=ev.top,
                            chat=[[round(t - raw_start, 1), u, x] for (t, u, x) in ev.chat])
             self.last_clip_end = end
             tmp = str(raw) + ".json.tmp"
@@ -566,7 +587,8 @@ class Worker:
                 json.dump(job, f, ensure_ascii=False)
             os.replace(tmp, str(raw)[:-3] + ".json")
             self.clips += 1
-            self.emit(t="candidate", job=str(raw)[:-3] + ".json", score=job["score"], kind=job["kind"])
+            self.emit(t="candidate", job=str(raw)[:-3] + ".json", score=job["score"], kind=job["kind"],
+                      rank=job.get("rank", 0))
         except Exception:
             log.exception("не получилось собрать заготовку клипа")
 
@@ -635,9 +657,7 @@ class Worker:
                 elif c == "clip_now":
                     threading.Thread(target=self._make_candidate, args=(None,), daemon=True).start()
                 elif c == "reload":
-                    self.cfg = config.load()
-                    with self.det_lock:
-                        self._apply_learning()
+                    self._reload()
             with self.det_lock:
                 ev = self.det.tick(now)
                 rate, level, hot = self.det.rate, self.det.level, self.det.hype is not None
@@ -709,8 +729,8 @@ def _fake_chat(worker: Worker) -> None:
         hot = burst_at <= el < burst_at + 15
         for _ in range(rng.randint(30, 45) if hot else rng.randint(6, 12)):
             text = rng.choice(fun) if (hot and rng.random() < 0.85) or rng.random() < 0.05 else rng.choice(calm)
-            k = rng.randint(1, 500)
-            name = f"{names[k % len(names)]}{k if k % 3 == 0 else ''}"
+            k = rng.randint(1, 3000)                     # зрителей много, как в большом чате: пара человек клипом не станет
+            name = f"{names[k % len(names)]}{k if k > 30 else ''}"
             worker._on_chat(time.time(), name.lower(), text, {"name": name, "color": colors[k % len(colors)]})
         time.sleep(1)
 

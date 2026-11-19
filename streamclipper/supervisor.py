@@ -17,7 +17,7 @@ import threading
 import time
 from pathlib import Path
 
-from . import config, segments, system, updater, util
+from . import config, netmeter, pacer, segments, system, updater, util
 from .learning import Learner
 from .uploader import Telegram
 
@@ -138,6 +138,8 @@ class Supervisor:
         self.editing = ""
         self.recording_off = False                      # запись остановлена, идёт только монтаж пойманного
         self._drop_hint = 0.0
+        self.pacer = pacer.Pacer(self.cfg.get("clips_per_hour"))     # очередь моментов: не больше N клипов в час
+        self._pace_hint = 0.0
         self.tg = Telegram(self._on_tg)
         self.learner = Learner()
         self.stats = self._load_stats()
@@ -283,9 +285,7 @@ class Supervisor:
                     if msg.get("state") == "live":
                         h.backoff = 3.0
                 elif t == "candidate":
-                    self.say(f"{h.name}: пойман момент" + (f" (оценка {msg['score']})" if msg.get("score") else "")
-                             + ", монтирую…")
-                    self._enqueue(msg["job"], msg.get("score") or 0, msg.get("kind") == "manual")
+                    self._candidate(h.name, msg)
                 elif t == "event":
                     k = msg.get("kind")
                     if k == "online":
@@ -302,15 +302,26 @@ class Supervisor:
                         if h.online and not h.off_at:
                             h.off_at = time.time()
                     elif k == "slow_net":
+                        floor = msg.get("floor") or 0
                         if msg.get("new"):
                             self.say(f"{h.name}: интернет не успевает за качеством {msg.get('old', '?')}, дальше "
                                      f"записываю в {msg['new']}", "error")
+                        elif floor:
+                            self.say(f"{h.name}: интернет не успевает за качеством {msg.get('old', '?')}, а ниже "
+                                     f"{floor}p программа его не опускает. Убери часть стримов: пока интернета не "
+                                     f"хватает, запись идёт с дырами и клипов меньше", "error")
                         else:
                             self.say(f"{h.name}: интернет не успевает даже за самым низким качеством. "
                                      "Убери часть стримов", "error")
-                        self.tg.alert("📶 Интернет не успевает записывать все стримы сразу. Программа сама снижает "
-                                      "качество записи. Если так бывает часто, поставь в настройках качество пониже "
-                                      "или убери часть стримов.", "slow-net", 3600)
+                        if floor and not msg.get("new"):
+                            self.tg.alert(f"📶 Интернет не успевает записывать все стримы сразу даже в {floor}p, а ниже "
+                                          "программа качество не опускает. Убери один-два стрима: пока интернета не "
+                                          "хватает, запись идёт с дырами и клипов меньше.", "slow-net-floor", 3600)
+                        else:
+                            low = netmeter.floor_of(self.cfg)
+                            self.tg.alert("📶 Интернет не успевает записывать все стримы сразу. Программа сама снижает "
+                                          "качество записи" + (f", но не ниже {low}p" if low else "") + ". Если так "
+                                          "бывает часто, убери часть стримов.", "slow-net", 3600)
                     elif k == "no_video":
                         self.say(f"{h.name}: клип не сделан, в буфере пока нет видео", "error")
                     elif k == "disk_full":
@@ -368,6 +379,13 @@ class Supervisor:
                         self._check(h, now)
                     except Exception:
                         log.exception("monitor %s", h.name)
+            try:
+                if self.recording_off:                  # запись остановлена: дожидаться очереди уже незачем
+                    self._flush_waiting()
+                else:
+                    self._pace(now)
+            except Exception:
+                log.exception("очередь моментов")
 
     def stop_recording(self) -> None:
         """Останавливает запись всех каналов, а монтаж уже пойманных моментов продолжается.
@@ -378,6 +396,7 @@ class Supervisor:
             self._stop_all(handles)
             for h in handles:
                 h.status = {"state": "stopped"}
+        self._flush_waiting()                           # новых моментов не будет: ждать очереди больше незачем
 
     def _check(self, h: WorkerHandle, now: float) -> None:
         if self.stop.is_set() or self.recording_off:
@@ -457,6 +476,7 @@ class Supervisor:
             restart = any(self.cfg.get(k) != cfg.get(k) for k in ("quality", "twitch_oauth"))
             self.cfg = cfg
             config.save(cfg)
+            self.pacer.set_rate(cfg.get("clips_per_hour"))
             self._check_clips_dir(cfg)
             if restart:
                 self._stop_all(list(self.workers.values()))
@@ -495,6 +515,70 @@ class Supervisor:
                             "chat": s.get("chat", False), "bar": s.get("bar", 0), "skips": s.get("skips") or {}})
         return out
 
+    # --- очередь моментов: не больше N клипов в час ---------------------------
+    @staticmethod
+    def _job_channel(job: str) -> str:
+        return os.path.basename(job).rsplit("_", 3)[0]
+
+    def _candidate(self, name: str, msg: dict) -> None:
+        """Запись поймала момент. Клип по кнопке монтируется сразу. Остальные выходят не чаще, чем задано
+        в настройках: первым идёт самый сильный, а когда моментов слишком много, слабые пропускаются."""
+        job = msg["job"]
+        manual = msg.get("kind") == "manual"
+        try:
+            score = int(msg.get("score") or 0)
+        except (TypeError, ValueError):
+            score = 0
+        caught = f"{name}: пойман момент" + (f" (оценка {score})" if score else "")
+        if manual or self.recording_off or not self.pacer.gap:
+            self.say(caught + ", монтирую…")
+            self._enqueue(job, score, manual)
+            return
+        try:
+            rank = float(msg.get("rank") or 0) or score / 100.0
+        except (TypeError, ValueError):
+            rank = score / 100.0
+        now = time.time()
+        self._pace(now)                                 # сначала уходит тот, кому уже пора: место в очереди освобождается
+        lost = self.pacer.offer(job, rank, score, now)
+        for other, other_score in lost:
+            if other != job:
+                self._pass_over(other, other_score, "клипов больше, чем задано в час, а в очереди есть сильнее")
+        if any(other == job for other, _s in lost):
+            self._drop_job(job)
+            self.say(caught + ", но пропущен: клипов больше, чем задано в час, а в очереди есть сильнее")
+            return
+        if self._pace(now, job):
+            self.say(caught + ", монтирую…")
+            return
+        text = caught + ", ждёт очереди примерно до " + time.strftime("%H:%M", time.localtime(self.pacer.eta(job, now)))
+        if now - self._pace_hint > 1800:                # объяснение показываем изредка, чтобы не засорять журнал
+            self._pace_hint = now
+            text += (f". Клипы выходят не чаще раза в {pacer.every(self.pacer.gap)}, первым идёт самый сильный "
+                     f"момент. Предел меняется в настройках: «Клипов в час, не больше»")
+        self.say(text)
+
+    def _pace(self, now: float, fresh: str = "") -> bool:
+        """Отправляет на монтаж момент, до которого дошла очередь. True: это только что пойманный fresh."""
+        out, old = self.pacer.due(now)
+        for job, score in old:
+            self._pass_over(job, score, "его слишком долго обходили более сильные")
+        for job, score in out:
+            if job != fresh:
+                self.say(f"{self._job_channel(job)}: подошла очередь момента"
+                         + (f" (оценка {score})" if score else "") + ", монтирую…")
+            self._enqueue(job, score)
+        return any(job == fresh for job, _s in out)
+
+    def _flush_waiting(self) -> None:
+        """Все моменты, что ждут очереди, идут на монтаж сразу, самые сильные первыми."""
+        for job, score in self.pacer.flush():
+            self._enqueue(job, score)
+
+    def _pass_over(self, job: str, score: int, why: str) -> None:
+        self._drop_job(job)
+        self.say(f"{self._job_channel(job)}: момент пропущен" + (f" (оценка {score})" if score else "") + f": {why}")
+
     # --- монтаж -----------------------------------------------------------
     def _enqueue(self, job: str, score: int = 0, manual: bool = False) -> None:
         """Ставит заготовку на монтаж. Если очередь переполнена, самые слабые моменты из неё пропускаются."""
@@ -505,7 +589,7 @@ class Supervisor:
         for lost, lost_score in self.edit_q.put(job, score, manual):
             self._drop_job(lost)
             self.edit_fail.pop(lost, None)
-            ch = os.path.basename(lost).rsplit("_", 3)[0]
+            ch = self._job_channel(lost)
             text = f"Монтаж не успевает за стримами: самый слабый момент пропущен ({ch}, оценка {lost_score})"
             now = time.time()
             if now - self._drop_hint > 1800:            # совет показываем изредка, чтобы не засорять журнал
@@ -575,11 +659,15 @@ class Supervisor:
                 self.say(f"Клип не получился: {res.get('error')}", "error")
                 self._drop_job(job)
                 self.edit_fail.pop(job, None)
+                if not manual:
+                    self.pacer.refund()                 # клипа не вышло: его место в часе не потрачено
             return
         self.edit_fail.pop(job, None)
         if res.get("skipped"):
             self.say(f"Момент пропущен: {res['skipped']}")
             self._drop_job(job)
+            if not manual:
+                self.pacer.refund()
             return
         ch = res["channel"]
         with self.lock:

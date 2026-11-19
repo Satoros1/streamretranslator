@@ -132,7 +132,7 @@ def main() -> int:
                             "-vf", "scale=540:-2", os.path.join(out, "live_vertical_%d.jpg" % i)])
     # Хронология монтажа: успевает ли он за моментами. Печатается в конце, чтобы попасть в хвост лога.
     marks = ("пойман момент", "клип готов", "пропущен", "не удался", "не получился", "Запущено", "перезапускаю",
-             "стрим закончился", "стрим в эфире", "интернет не успевает")
+             "стрим закончился", "стрим в эфире", "интернет не успевает", "подошла очередь")
     caught = [ln for ln in text.splitlines() if "INFO supervisor" in ln and any(m in ln for m in marks)]
     print("TIMELINE (%d lines):" % len(caught))
     for ln in caught[:150]:
@@ -141,6 +141,10 @@ def main() -> int:
     print("moments caught: %d, clips made: %d, dropped as weakest: %d, left unedited: %s" % (
         sum("пойман момент" in ln for ln in caught), sum("клип готов" in ln for ln in caught),
         sum("Монтаж не успевает" in ln for ln in caught), left.group(1) if left else "0"))
+    # Предел клипов в час: сколько моментов ждали очереди и сколько из них уступили более сильным.
+    print("hourly limit: %d moments waited for their turn, %d passed over for stronger ones" % (
+        sum("ждёт очереди" in ln for ln in caught),
+        sum("в очереди есть сильнее" in ln or "обходили более сильные" in ln for ln in caught)))
     # Отбор: сколько всплесков чата программа сочла слишком слабыми для клипа и почему.
     weak: dict[str, int] = {}
     shown = 0
