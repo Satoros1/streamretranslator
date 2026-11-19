@@ -11,6 +11,9 @@
 3. Словарь канала. Слова и эмоуты, которыми именно этот чат реагирует на удачные моменты
    (локальные мемы, эмоуты канала), начинают считаться реакцией. Слова, которые
    всплывают в плохих клипах (спам, боты, рейды), наоборот, перестают учитываться.
+
+Каждая оценка и каждый сделанный из неё вывод записываются в дневник простыми словами (см. bible.py):
+его можно прочитать на странице «Обучение».
 """
 from __future__ import annotations
 
@@ -28,6 +31,7 @@ FEATURES = ("z", "share", "laugh", "dur", "msgs", "clipreq", "uniq", "learned")
 MIN_LABELS = 8          # с этого числа оценок модель начинает влиять
 L2 = 2.0
 MULT_MIN, MULT_MAX = 0.6, 1.6
+DIARY_KEEP = 400        # столько последних записей дневника хранится
 
 _TOK = re.compile(r"[^\W\d_]{2,30}", re.U)
 _REP = re.compile(r"(.)\1{2,}", re.U)
@@ -87,6 +91,7 @@ class Learner:
                 descr TEXT DEFAULT '', label INTEGER, label_src TEXT DEFAULT '', labeled_at REAL);
             CREATE INDEX IF NOT EXISTS clips_path ON clips(path);
             CREATE TABLE IF NOT EXISTS kv(key TEXT PRIMARY KEY, value TEXT);
+            CREATE TABLE IF NOT EXISTS diary(id INTEGER PRIMARY KEY AUTOINCREMENT, ts REAL, channel TEXT, text TEXT);
             """)
         self._cache: tuple[float, dict] = (0.0, {})
 
@@ -128,17 +133,48 @@ class Learner:
     def label(self, clip_id: str, good: bool | None, src: str = "app") -> bool:
         val = None if good is None else int(bool(good))
         with self.lock, self._db() as db:
-            row = db.execute("SELECT label FROM clips WHERE id=?", (clip_id,)).fetchone()
+            row = db.execute("SELECT label, channel, title FROM clips WHERE id=?", (clip_id,)).fetchone()
             if not row or row["label"] == val:
                 return False
             db.execute("UPDATE clips SET label=?, label_src=?, labeled_at=? WHERE id=?",
                        (val, src, time.time(), clip_id))
+        if val is not None:
+            where = "реакциями в канале" if src == "telegram" else "в программе"
+            what = f"клип «{row['title']}»" if row["title"] else "клип"
+            self.note(row["channel"], f"Проба: {what} {'понравился' if val else 'не понравился'} (оценка {where}).")
         self.train()
         return True
+
+    # --- дневник ------------------------------------------------------------
+    def note(self, channel: str, text: str) -> None:
+        """Запись в дневник обучения: что произошло и какой из этого сделан вывод."""
+        self.note_many([(channel, text)])
+
+    def note_many(self, entries: list[tuple[str, str]]) -> None:
+        if not entries:
+            return
+        now = time.time()
+        with self.lock, self._db() as db:
+            db.executemany("INSERT INTO diary(ts, channel, text) VALUES(?,?,?)", [(now, c or "", t) for c, t in entries])
+            db.execute("DELETE FROM diary WHERE id <= (SELECT MAX(id) FROM diary) - ?", (DIARY_KEEP,))
+
+    def diary(self, limit: int = 40) -> list[dict]:
+        """Последние записи дневника, новые сверху."""
+        with self.lock, self._db() as db:
+            rows = db.execute("SELECT ts, channel, text FROM diary ORDER BY id DESC LIMIT ?", (limit,)).fetchall()
+        return [dict(r) for r in rows]
+
+    def stats(self) -> dict[str, dict]:
+        """По каналам: сколько клипов сделано, сколько понравилось, не понравилось и вырезано кнопкой."""
+        with self.lock, self._db() as db:
+            rows = db.execute("SELECT channel, SUM(path != '') AS clips, SUM(label = 1) AS good, SUM(label = 0) AS bad, "
+                              "SUM(kind = 'manual') AS manual FROM clips GROUP BY channel").fetchall()
+        return {r["channel"]: {k: int(r[k] or 0) for k in ("clips", "good", "bad", "manual")} for r in rows}
 
     # --- обучение -----------------------------------------------------------
     def train(self) -> dict:
         """Пересчитывает всё с нуля по всем оценкам. Это доли секунды даже на тысячах клипов."""
+        before = self.model()
         with self.lock, self._db() as db:
             rows = db.execute("SELECT channel, kind, features, tokens, base_score, label FROM clips "
                               "WHERE label IS NOT NULL OR kind='manual' ORDER BY created DESC LIMIT 1500").fetchall()
@@ -202,6 +238,11 @@ class Learner:
         with self.lock, self._db() as db:
             db.execute("INSERT OR REPLACE INTO kv(key, value) VALUES('model', ?)", (json.dumps(model, ensure_ascii=False),))
         self._cache = (0.0, {})
+        try:
+            from . import bible
+            self.note_many(bible.lessons(before, model))      # что изменилось после этой оценки, простыми словами
+        except Exception:
+            pass                                              # дневник не должен мешать обучению
         return model
 
     def model(self) -> dict:
