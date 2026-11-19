@@ -93,16 +93,6 @@ jobs:
           python packaging/vertical_smoke.py dist\StreamClipper\sc-worker.exe
           if ($LASTEXITCODE) { exit $LASTEXITCODE }
 
-      - name: Live Twitch smoke test (built exe)
-        shell: pwsh
-        continue-on-error: true
-        timeout-minutes: 25
-        env:
-          SMOKE_OUT: smoke_clips
-          PYTHONUTF8: "1"
-        run: |
-          python packaging/live_smoke.py dist\StreamClipper\sc-worker.exe 240
-
       - name: Installer
         shell: pwsh
         run: |
@@ -129,15 +119,6 @@ jobs:
           python packaging/update_smoke.py dist\StreamClipper-Setup.exe
           if ($LASTEXITCODE) { exit $LASTEXITCODE }
 
-      - uses: actions/upload-artifact@v4
-        if: always()
-        with:
-          name: checks
-          path: |
-            shots/*.png
-            smoke_clips/*
-          if-no-files-found: ignore
-
       # Выпуск: либо пушем тега v*, либо ручным запуском этой сборки с указанной версией
       - name: Release
         if: startsWith(github.ref, 'refs/tags/v') || (github.event_name == 'workflow_dispatch' && inputs.release != '')
@@ -160,3 +141,24 @@ jobs:
             dist/StreamClipper-Setup.exe
             dist/StreamClipper-portable.zip
           fail_on_unmatched_files: true
+
+      # Запись с настоящего Twitch идёт 8 минут и выпуск не останавливает (перед выпуском есть отдельная проверка
+      # live-check), поэтому стоит после выпуска: установщик выходит раньше, а результат всё равно виден в журнале.
+      - name: Live Twitch smoke test (built exe)
+        shell: pwsh
+        continue-on-error: true
+        timeout-minutes: 25
+        env:
+          SMOKE_OUT: smoke_clips
+          PYTHONUTF8: "1"
+        run: |
+          python packaging/live_smoke.py dist\StreamClipper\sc-worker.exe 240
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: checks
+          path: |
+            shots/*.png
+            smoke_clips/*
+          if-no-files-found: ignore
