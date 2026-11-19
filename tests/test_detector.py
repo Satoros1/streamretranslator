@@ -1,6 +1,6 @@
 import random
 
-from streamclipper.detector import EARLY, MIN_DUR, RARE, RARE_MIN, SENS, Detector
+from streamclipper.detector import EARLY, MIN_DUR, PAUSE, RARE, RARE_MIN, SENS, STRONGER, Detector
 from streamclipper.lexicon import classify, normalize
 
 
@@ -179,9 +179,44 @@ def test_first_minutes_take_only_the_obvious():
     assert MIN_DUR >= 6
 
 
+def test_pause_after_a_clip():
+    """Горячие минуты: чат взрывается раз за разом. На Twitch один стрим дал так 5 клипов за 8 минут."""
+    det = Detector(3)
+    for m in range(40):
+        det.minute_peaks.append((m, 3.0))
+    t = 40 * 60.0
+    burst = {"onset": t, "peak_z": 20.0, "peak_rate": 6.0}
+    assert not det._too_weak(burst)
+    det.last_clip = (t - 60, 6.0)                            # минуту назад с этого канала уже был клип такой же силы
+    assert "только что был" in det._too_weak(burst)
+    assert not det._too_weak(dict(burst, peak_rate=6.0 * STRONGER))          # заметно сильнее: берём, не дожидаясь
+    assert not det._too_weak(dict(burst, onset=t - 60 + PAUSE[3]))           # пауза прошла: берём
+    det.set_sensitivity(1)
+    assert "только что был" in det._too_weak(dict(burst, onset=t - 60 + PAUSE[3], peak_rate=7.0, peak_z=40.0))   # строже: пауза дольше
+    det.set_sensitivity(5)
+    assert not det._too_weak(burst)                          # «брать почти всё»: без паузы
+    assert PAUSE[1] > PAUSE[3] > PAUSE[5] == 0 and set(PAUSE) == set(SENS)
+
+
+def test_hot_stretch_gives_the_best_clip_not_five():
+    hot = tuple(20 * 60 + k * 85 for k in range(5))          # пять взрывов чата подряд, каждые полторы минуты
+    later = 36 * 60                                          # и ещё один через десять минут после них
+    plain = Detector(3)
+    plain.pause = 0
+    before = stream(plain, 42, bigs=hot + (later,))
+    det = Detector(3)
+    events = stream(det, 42, bigs=hot + (later,))
+    in_hot = [e for e in events if hot[0] - 12 <= e <= hot[-1] + 18]
+    assert len([e for e in before if hot[0] - 12 <= e <= hot[-1] + 18]) >= 3         # так было
+    assert caught(events, hot[0]) and len(in_hot) <= 2, events                        # так стало
+    assert caught(events, later), events                                              # после паузы моменты снова берутся
+    assert det.skipped["клип с этого канала только что был, а этот момент не сильнее"] >= 1
+
+
 def test_restart_forgets_what_was_strong():
     det = Detector(3)
     for m in range(40):
         det.minute_peaks.append((m, 9.0))
+    det.last_clip = (1_999_000.0, 9.0)
     det.restart(2_000_000.0)
-    assert not det.minute_peaks and det.rare_bar(3_000_000) is None
+    assert not det.minute_peaks and det.rare_bar(3_000_000) is None and det.last_clip is None
