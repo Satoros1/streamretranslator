@@ -72,7 +72,7 @@ class Worker:
     def emit(self, **msg) -> None:
         with self.out_lock:
             try:
-                sys.stdout.write(json.dumps(msg, ensure_ascii=False) + "\n")
+                sys.stdout.write(json.dumps(msg) + "\n")
                 sys.stdout.flush()
             except (OSError, ValueError):
                 self.stop.set()
@@ -170,7 +170,7 @@ class Worker:
         ff = None
         last = time.time()
         try:
-            while not self.stop.is_set():
+            while not self.stop.is_set() and not self.cfg.get("paused"):
                 try:
                     chunk = q.get(timeout=1.0)
                 except queue.Empty:
@@ -225,6 +225,10 @@ class Worker:
             started = time.time()
             try:
                 self._pump(src)
+            except FileNotFoundError:
+                self.state, self.detail = "error", "не найден ffmpeg, переустанови программу"
+                log.error("ffmpeg не найден: %s", util.find_tool("ffmpeg"))
+                self.stop.wait(30)
             except Exception:
                 log.exception("ошибка записи")
             finally:
@@ -232,7 +236,7 @@ class Worker:
                     src.close()
                 except Exception:
                     pass
-            if not self.stop.is_set():
+            if not self.stop.is_set() and self.state != "error":
                 self.state = "offline"
                 if time.time() - started > 120:
                     self.emit(t="event", kind="offline")

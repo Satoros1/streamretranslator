@@ -33,7 +33,13 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          gh release download latest -R BtbN/FFmpeg-Builds -p "ffmpeg-n7.1-latest-win64-gpl-shared-7.1.zip" -O ffmpeg.zip
+          # берём самую свежую стабильную ветку ffmpeg (n8.x, n7.x ...), а если её нет, то master
+          $names = gh release view latest -R BtbN/FFmpeg-Builds --json assets --jq ".assets[].name"
+          $pick = $names | Where-Object { $_ -match '^ffmpeg-n[\d.]+-latest-win64-gpl-shared-[\d.]+\.zip$' } | Sort-Object { [version](($_ -split '-')[1].TrimStart('n')) } | Select-Object -Last 1
+          if (-not $pick) { $pick = "ffmpeg-master-latest-win64-gpl-shared.zip" }
+          Write-Host "ffmpeg build: $pick"
+          gh release download latest -R BtbN/FFmpeg-Builds -p $pick -O ffmpeg.zip
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
           Expand-Archive ffmpeg.zip -DestinationPath ffmpeg_tmp
           New-Item -ItemType Directory -Force ffmpeg | Out-Null
           Copy-Item ffmpeg_tmp\*\bin\*.dll ffmpeg\

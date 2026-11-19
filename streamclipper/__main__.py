@@ -31,6 +31,12 @@ def selftest() -> int:
 
 def cli(argv: list[str]) -> int:
     cmd = argv[0] if argv else "gui"
+    # В Windows вывод по умолчанию не в UTF-8, и русские буквы в нём роняли бы служебный процесс
+    for stream in (sys.stdout, sys.stderr, sys.stdin):
+        try:
+            stream.reconfigure(encoding="utf-8", errors="replace")
+        except Exception:
+            pass
     if cmd == "worker":
         from . import worker
         return worker.main(argv[1])

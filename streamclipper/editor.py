@@ -201,6 +201,6 @@ def main(job_path: str) -> int:
     except Exception as e:
         log.exception("монтаж упал")
         res = {"ok": False, "error": str(e)[:300]}
-    sys.stdout.write(json.dumps(res, ensure_ascii=False) + "\n")
+    sys.stdout.write(json.dumps(res) + "\n")
     sys.stdout.flush()
     return 0 if res.get("ok") else 1
