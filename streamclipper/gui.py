@@ -1,24 +1,26 @@
-"""Окно программы. Слева меню, справа страницы: Стримы, Клипы, Telegram, Журнал, Настройки."""
+"""Окно программы. Слева меню, справа страницы: Стримы, Клипы, Обучение, Telegram, Журнал, Настройки.
+
+Внешний вид и направление описаны в ui/theme.py."""
 from __future__ import annotations
 
+import html
 import os
 import sys
 import threading
 import time
 import webbrowser
 
-from PySide6.QtCore import QObject, QSize, Qt, QTimer, Signal
-from PySide6.QtCore import QRectF
-from PySide6.QtGui import QAction, QPainter
+from PySide6.QtCore import QObject, QRectF, QSize, Qt, QTimer, Signal
+from PySide6.QtGui import QAction, QColor, QFontMetrics, QPainter, QPainterPath, QPixmap
 from PySide6.QtWidgets import (QApplication, QCheckBox, QComboBox, QFileDialog, QFrame, QHBoxLayout, QLabel,
-                               QLineEdit, QMenu, QMessageBox, QPlainTextEdit, QProgressBar, QPushButton,
-                               QScrollArea, QSlider, QSpinBox, QStackedWidget, QSystemTrayIcon, QToolButton,
-                               QVBoxLayout, QWidget)
+                               QLineEdit, QMenu, QMessageBox, QPlainTextEdit, QPushButton, QScrollArea, QSlider,
+                               QSpinBox, QStackedWidget, QSystemTrayIcon, QToolButton, QVBoxLayout, QWidget)
 
 from . import APP_NAME, __version__, bible, config, system, updater, util
 from .supervisor import Supervisor
 from .uploader import TG_KEYS, pick_channel, summarize_test
 from .ui import theme as T
+from .ui.frames import Frames
 
 
 # ----------------------------------------------------------------- мелкие помощники
@@ -35,7 +37,9 @@ def button(text: str, kind: str | None = None, icon: str | None = None) -> QPush
     if kind:
         b.setObjectName(kind)
     if icon:
-        b.setIcon(T.icon(icon, "#FFFFFF" if kind == "primary" else T.INK))
+        b.setIcon(T.icon(icon, T.ON_ACCENT if kind == "primary" else T.TEXT_2))
+        b.setIconSize(QSize(16, 16))
+    b.setFocusPolicy(Qt.FocusPolicy.TabFocus)
     b.setCursor(Qt.CursorShape.PointingHandCursor)
     return b
 
@@ -44,22 +48,22 @@ def tool(icon: str, tip: str, name: str | None = None, checkable: bool = False,
          on_color: str | None = None) -> QToolButton:
     b = QToolButton()
     b.setIcon(T.icon(icon, T.MUTED, on_color=on_color))
-    b.setIconSize(QSize(18, 18))
+    b.setIconSize(QSize(16, 16))
     b.setToolTip(tip)
     b.setCheckable(checkable)
+    b.setFocusPolicy(Qt.FocusPolicy.TabFocus)
     if name:
         b.setObjectName(name)
     b.setCursor(Qt.CursorShape.PointingHandCursor)
     return b
 
 
-def card(name: str = "card") -> tuple[QFrame, QVBoxLayout]:
+def card(name: str = "card", margins: tuple[int, int, int, int] = (24, 20, 24, 20)) -> tuple[QFrame, QVBoxLayout]:
     f = QFrame()
     f.setObjectName(name)
     lay = QVBoxLayout(f)
-    lay.setContentsMargins(22, 18, 22, 18)
-    lay.setSpacing(10)
-    T.shadow(f)
+    lay.setContentsMargins(*margins)
+    lay.setSpacing(12)
     return f, lay
 
 
@@ -83,13 +87,14 @@ def page(title: str, subtitle: str) -> tuple[QScrollArea, QVBoxLayout]:
     inner = QWidget()
     inner.setObjectName("page")
     lay = QVBoxLayout(inner)
-    lay.setContentsMargins(36, 30, 36, 30)
+    lay.setContentsMargins(32, 28, 32, 32)
     lay.setSpacing(16)
     head = QVBoxLayout()
-    head.setSpacing(6)
+    head.setSpacing(8)
     head.addWidget(label(title, "h1"))
     head.addWidget(label(subtitle, "muted", wrap=True))
     lay.addLayout(head)
+    lay.addSpacing(8)
     area.setWidget(inner)
     return area, lay
 
@@ -98,44 +103,159 @@ def setting_row(title: str, desc: str, control: QWidget, last: bool = False) -> 
     row = QFrame()
     row.setObjectName("rowLast" if last else "row")
     h = QHBoxLayout(row)
-    h.setContentsMargins(0, 8, 0, 10)
+    h.setContentsMargins(0, 12, 0, 12)
+    h.setSpacing(24)
     v = QVBoxLayout()
-    v.setSpacing(2)
+    v.setSpacing(4)
     v.addWidget(label(title))
     if desc:
         v.addWidget(label(desc, "small", wrap=True))
     h.addLayout(v, 1)
-    h.addSpacing(16)
     h.addWidget(control, 0, Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
     return row
 
 
-class Avatar(QWidget):
-    """Цветная плитка с первой буквой канала."""
+def section(title: str) -> tuple[QFrame, QVBoxLayout]:
+    """Карточка раздела: заголовок, под ним строки с тонкими линиями между ними."""
+    c, cl = card(margins=(24, 20, 24, 8))
+    cl.setSpacing(0)
+    cl.addWidget(label(title, "h2"))
+    cl.addSpacing(4)
+    return c, cl
 
-    def __init__(self, name: str, size: int = 46):
+
+class Dot(QWidget):
+    """Лампочка состояния: красная, пока идёт запись, янтарная, когда в чате движ, серая, когда тихо."""
+
+    def __init__(self, color: str = T.DIM, size: int = 8):
         super().__init__()
-        self.name = name
+        self.color = color
         self.setFixedSize(size, size)
+
+    def set_color(self, color: str) -> None:
+        if color != self.color:
+            self.color = color
+            self.update()
 
     def paintEvent(self, _e) -> None:  # noqa: N802
         p = QPainter(self)
         p.setRenderHint(QPainter.RenderHint.Antialiasing)
-        T.draw_tile(p, QRectF(0, 0, self.width(), self.height()), self.name[:1].upper(), self.name, self.width() * 0.3)
+        p.setPen(Qt.PenStyle.NoPen)
+        p.setBrush(QColor(self.color))
+        p.drawEllipse(QRectF(0, 0, self.width(), self.height()))
         p.end()
 
 
-def stat_tile(name: str) -> tuple[QFrame, QLabel]:
-    f = QFrame()
-    f.setObjectName("stat")
-    lay = QVBoxLayout(f)
-    lay.setContentsMargins(18, 14, 18, 14)
-    lay.setSpacing(2)
-    value = label("0", "statValue")
+class Meter(QWidget):
+    """Сегментный индикатор, как на звуковом пульте: движ в чате у стрима, сила момента у клипа."""
+
+    def __init__(self, segments: int, width: int, height: int = 8):
+        super().__init__()
+        self.segments = segments
+        self.level = 0.0
+        self.color = T.TEXT_2
+        self.setFixedSize(width, height)
+
+    def set(self, level: float, color: str) -> None:
+        if (level, color) != (self.level, self.color):
+            self.level, self.color = level, color
+            self.update()
+
+    def paintEvent(self, _e) -> None:  # noqa: N802
+        p = QPainter(self)
+        p.setRenderHint(QPainter.RenderHint.Antialiasing)
+        T.meter(p, QRectF(0, 0, self.width(), self.height()), self.level, self.segments, self.color)
+        p.end()
+
+
+class Frame(QWidget):
+    """Картинка в рамке: кадр со стрима или обложка клипа. Пока картинки нет, видна буква канала."""
+
+    def __init__(self, name: str, w: int, h: int, radius: float = 4):
+        super().__init__()
+        self.name = name
+        self.radius = radius
+        self.pix: QPixmap | None = None
+        self.stamp = 0.0
+        self.dim = False
+        self.setFixedSize(w, h)
+
+    def show_file(self, got: tuple[str, float] | None, dim: bool = False) -> None:
+        if got and got[1] != self.stamp:
+            pm = QPixmap(got[0])
+            if not pm.isNull():
+                self.pix, self.stamp = pm, got[1]
+                self.update()
+        if dim != self.dim:
+            self.dim = dim
+            self.update()
+
+    def paintEvent(self, _e) -> None:  # noqa: N802
+        p = QPainter(self)
+        p.setRenderHint(QPainter.RenderHint.Antialiasing)
+        p.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform)
+        r = QRectF(0, 0, self.width(), self.height())
+        if not self.pix:
+            T.monogram(p, r, self.name[:1].upper(), self.radius)
+            p.end()
+            return
+        clip = QPainterPath()
+        clip.addRoundedRect(r, self.radius, self.radius)
+        p.setClipPath(clip)
+        pw, ph = self.pix.width(), self.pix.height()
+        scale = max(r.width() / pw, r.height() / ph)          # заполняем рамку, лишнее по краям срезается
+        sw, sh = r.width() / scale, r.height() / scale
+        p.drawPixmap(r, self.pix, QRectF((pw - sw) / 2, (ph - sh) / 2, sw, sh))
+        if self.dim:                                         # стрим не пишется: кадр приглушён
+            p.fillRect(r, QColor(20, 20, 21, 150))
+        p.setClipping(False)
+        line = QColor(T.TEXT)
+        line.setAlphaF(0.08)
+        p.setPen(line)
+        p.setBrush(Qt.BrushStyle.NoBrush)
+        p.drawRoundedRect(r.adjusted(0.5, 0.5, -0.5, -0.5), self.radius, self.radius)
+        p.end()
+
+
+class ElidedLabel(QLabel):
+    """Строка, которая не раздвигает карточку: длинный текст обрезается многоточием."""
+
+    def __init__(self, name: str):
+        super().__init__()
+        self.setObjectName(name)
+        self.full = ""
+        self.setMinimumWidth(40)
+
+    def set_full(self, text: str) -> None:
+        if text != self.full:
+            self.full = text
+            self.setToolTip(text if len(text) > 40 else "")
+            self._fit()
+
+    def resizeEvent(self, e) -> None:  # noqa: N802
+        super().resizeEvent(e)
+        self._fit()
+
+    def _fit(self) -> None:
+        super().setText(QFontMetrics(self.font()).elidedText(self.full, Qt.TextElideMode.ElideRight, self.width()))
+
+
+def stat_cell(name: str) -> tuple[QWidget, QLabel]:
+    w = QWidget()
+    lay = QVBoxLayout(w)
+    lay.setContentsMargins(20, 16, 20, 16)
+    lay.setSpacing(8)
+    lay.addWidget(label(name, "small"))
+    value = label("0", "figure")
     lay.addWidget(value)
-    lay.addWidget(label(name, "statName"))
-    T.shadow(f, 22, 4, 16)
-    return f, value
+    return w, value
+
+
+def vline() -> QFrame:
+    f = QFrame()
+    f.setObjectName("vline")
+    f.setFixedWidth(1)
+    return f
 
 
 class Bridge(QObject):
@@ -162,15 +282,18 @@ _HOW_TO_VOTE = ("Чтобы оценить клип, зажми сообщени
                 "считается плохим. На оценках программа учится, что брать, а что нет.")
 VOTES_TEXT = {
     "": _HOW_TO_VOTE,
-    "on": "Реакции в канале включены ✅ " + _HOW_TO_VOTE,
+    "on": "Реакции в канале включены. " + _HOW_TO_VOTE,
     "off": "В канале сейчас выключены реакции, поэтому оценить клип негде. Нажми кнопку ниже, и под клипами "
            "появятся 👍 и 👎. " + _HOW_TO_VOTE,
 }
 
 
 # ----------------------------------------------------------------- карточка стрима
-STATE_CHIP = {"live": "chipLive", "ad": "chipWarn", "pause": "chipWarn", "error": "chipWarn",
-              "restarting": "chipWarn", "offline": "chipGray", "starting": "chipGray", "paused": "chipGray"}
+# Лампочка и подпись по состоянию записи: (цвет точки, стиль подписи)
+STATE_LOOK = {"live": (T.LIVE, "status"), "ad": (T.TEXT_2, "status"), "pause": (T.TEXT_2, "status"),
+              "restarting": (T.TEXT_2, "status"), "error": (T.BAD, "statusBad"), "offline": (T.DIM, "status"),
+              "starting": (T.DIM, "status"), "paused": (T.DIM, "status"), "stopped": (T.DIM, "status")}
+RECORDING = ("live", "ad", "pause")
 
 
 class StreamCard(QFrame):
@@ -178,36 +301,41 @@ class StreamCard(QFrame):
         super().__init__()
         self.setObjectName("card")
         self.name = name
-        T.shadow(self)
+        self.win = win
         lay = QHBoxLayout(self)
-        lay.setContentsMargins(20, 16, 16, 16)
+        lay.setContentsMargins(16, 16, 16, 16)
         lay.setSpacing(16)
-        lay.addWidget(Avatar(name), 0, Qt.AlignmentFlag.AlignTop)
+        self.frame = Frame(name, 160, 90)
+        lay.addWidget(self.frame, 0, Qt.AlignmentFlag.AlignTop)
         left = QVBoxLayout()
-        left.setSpacing(6)
+        left.setSpacing(4)
         top = QHBoxLayout()
-        top.setSpacing(10)
+        top.setSpacing(0)
         top.addWidget(label(name, "title"))
-        self.chip = label("запускается", "chipGray")
+        top.addSpacing(12)
+        self.dot = Dot()
+        top.addWidget(self.dot, 0, Qt.AlignmentFlag.AlignVCenter)
+        top.addSpacing(8)
+        self.chip = label("запускается", "status")
         top.addWidget(self.chip)
         top.addStretch(1)
         left.addLayout(top)
-        self.title = label("", "muted")
+        self.title = ElidedLabel("muted")
         left.addWidget(self.title)
-        self.meta = label("", "small")
+        self.meta = label("", "meta")
         left.addWidget(self.meta)
+        left.addSpacing(4)
         bar = QHBoxLayout()
         bar.setSpacing(8)
-        bar.addWidget(label("движ в чате", "small"))
-        self.level = QProgressBar()
-        self.level.setRange(0, 100)
-        self.level.setTextVisible(False)
-        self.level.setFixedWidth(220)
-        bar.addWidget(self.level)
+        bar.addWidget(label("Чат", "meta"))
+        self.level = Meter(32, 254)
+        self.level.setToolTip("Насколько бурно сейчас пишут в чате по сравнению с обычным для этого канала")
+        bar.addWidget(self.level, 0, Qt.AlignmentFlag.AlignVCenter)
         bar.addStretch(1)
         left.addLayout(bar)
+        left.addStretch(1)
         lay.addLayout(left, 1)
-        self.clip_btn = button("Клип сейчас", "primary", "clips")
+        self.clip_btn = button("Клип сейчас", None, "clips")
         self.clip_btn.setToolTip("Сохранить последние секунды прямо сейчас, если увидел что-то смешное сам")
         self.clip_btn.clicked.connect(lambda: win.sup.clip_now(name))
         lay.addWidget(self.clip_btn, 0, Qt.AlignmentFlag.AlignVCenter)
@@ -216,27 +344,37 @@ class StreamCard(QFrame):
         lay.addWidget(rm, 0, Qt.AlignmentFlag.AlignVCenter)
 
     def update_from(self, s: dict) -> None:
-        hot = s["text"].startswith("🔥")
+        state = s["state"]
         slow = bool(s.get("slow"))                       # интернет не успевает: это важнее, чем «идёт запись»
-        self.chip.setText(("● " if s["state"] == "live" and not hot and not slow else "") + s["text"])
+        hot = bool(s.get("hot")) and state == "live" and not slow
+        color, style = STATE_LOOK.get(state, (T.DIM, "status"))
+        if hot:
+            color, style = T.ACCENT, "statusHot"
+        elif slow:
+            color, style = T.LIVE, "statusBad"
+        self.dot.set_color(color)
+        self.chip.setText(s["text"])
         self.chip.setToolTip("Видео с Twitch скачивается медленнее, чем идёт эфир. Программа сама снизит качество "
                              "записи. Если не помогает, убери часть стримов." if slow else "")
-        restyle(self.chip, "chipHot" if hot else "chipWarn" if slow else STATE_CHIP.get(s["state"], "chipGray"))
+        restyle(self.chip, style)
         restyle(self, "cardHot" if hot else "card")
-        self.title.setText(s.get("title") or ("Жду, когда стример выйдет в эфир" if s["state"] == "offline" else ""))
-        self.title.setVisible(bool(self.title.text()))
+        self.title.set_full(s.get("title") or ("Жду, когда стример выйдет в эфир" if state == "offline" else ""))
         parts = []
-        if s["state"] in ("live", "ad", "pause"):
-            parts.append(f"чат: {s['rate']:.0f} сообщ/с" if s.get("chat") else "чат: подключаюсь…")
+        if state in RECORDING:
+            parts.append(f"{s['rate']:.0f} сообщ/с" if s.get("chat") else "чат: подключаюсь…")
             if s.get("quality"):
-                parts.append(f"качество {s['quality']}")
+                parts.append(s["quality"])
             if s.get("lang") in ("ru", "en"):            # язык стрима: программа понимает его по чату сама
                 parts.append({"ru": "русский", "en": "английский"}[s["lang"]])
-            parts.append(f"на диске {s['buf_mb']} МБ")
-        parts.append(f"клипов: {s['clips']}")
+            parts.append(f"буфер {s['buf_mb']} МБ")
+        parts.append(f"клипов {s['clips']}")
         self.meta.setText(" · ".join(parts))
-        self.level.setValue(int(100 * s.get("level", 0)))
-        self.clip_btn.setEnabled(s["state"] in ("live", "ad", "pause"))
+        self.level.set(s.get("level", 0) if state in RECORDING else 0.0, T.ACCENT if hot else T.TEXT_2)
+        self.clip_btn.setEnabled(state in RECORDING)
+        if state in RECORDING and self.win.isVisible() and self.win.stack.currentIndex() == 0:
+            self.frame.show_file(self.win.frames.stream(self.name), dim=state != "live")
+        elif state not in RECORDING:
+            self.frame.show_file(None, dim=True)
 
 
 # ----------------------------------------------------------------- главное окно
@@ -245,6 +383,7 @@ class MainWindow(QWidget):
         super().__init__()
         self.sup = sup
         self.bridge = Bridge()
+        self.frames = Frames()
         self.cards: dict[str, StreamCard] = {}
         self.really_quit = False
         self.for_update = False                 # программа закрывается, чтобы установщик поставил новую версию
@@ -254,8 +393,8 @@ class MainWindow(QWidget):
         self.setObjectName("root")
         self.setWindowTitle(APP_NAME)
         self.setWindowIcon(T.app_icon())
-        self.resize(1120, 780)
-        self.setMinimumSize(900, 600)
+        self.resize(1200, 800)
+        self.setMinimumSize(960, 620)
 
         outer = QVBoxLayout(self)
         outer.setContentsMargins(0, 0, 0, 0)
@@ -263,7 +402,11 @@ class MainWindow(QWidget):
         self.update_bar = QFrame()
         self.update_bar.setObjectName("updateBar")
         ub = QHBoxLayout(self.update_bar)
-        ub.setContentsMargins(20, 8, 20, 8)
+        ub.setContentsMargins(24, 8, 24, 8)
+        ub.setSpacing(12)
+        up_icon = QLabel()
+        up_icon.setPixmap(T.icon("download", T.ACCENT).pixmap(16, 16))
+        ub.addWidget(up_icon)
         self.update_label = label("", wrap=True)
         ub.addWidget(self.update_label, 1)
         self.update_alt = button("Скачать вручную")
@@ -302,6 +445,9 @@ class MainWindow(QWidget):
             self.tray.activated.connect(lambda r: self.show_window() if r == QSystemTrayIcon.ActivationReason.Trigger else None)
             self.tray.show()
 
+        self.setFocusPolicy(Qt.FocusPolicy.ClickFocus)
+        self.setFocus()                                   # при запуске ничего не подсвечено рамкой фокуса
+        system.dark_title_bar(int(self.winId()))
         self.timer = QTimer(self)
         self.timer.timeout.connect(self.tick)
         self.timer.start(500)
@@ -311,38 +457,44 @@ class MainWindow(QWidget):
     def _sidebar(self) -> QWidget:
         side = QWidget()
         side.setObjectName("sidebar")
-        side.setFixedWidth(228)
+        side.setAttribute(Qt.WidgetAttribute.WA_StyledBackground, True)
+        side.setFixedWidth(240)
         lay = QVBoxLayout(side)
-        lay.setContentsMargins(16, 22, 16, 18)
-        lay.setSpacing(5)
+        lay.setContentsMargins(12, 20, 12, 16)
+        lay.setSpacing(4)
         brand = QHBoxLayout()
-        logo = QLabel()
-        logo.setPixmap(T.draw_logo(64))
-        logo.setScaledContents(True)
-        logo.setFixedSize(34, 34)
+        brand.setContentsMargins(12, 0, 0, 0)
         brand.setSpacing(10)
+        logo = QLabel()
+        logo.setPixmap(T.draw_logo(64, tile=False))
+        logo.setScaledContents(True)
+        logo.setFixedSize(18, 18)
         brand.addWidget(logo)
         brand.addWidget(label(APP_NAME, "brand"))
         brand.addStretch(1)
         lay.addLayout(brand)
-        lay.addSpacing(22)
+        lay.addSpacing(24)
         self.nav: list[QPushButton] = []
         for i, (text, ic) in enumerate((("Стримы", "streams"), ("Клипы", "clips"), ("Обучение", "learn"),
                                         ("Telegram", "send"), ("Журнал", "log"), ("Настройки", "settings"))):
             b = QPushButton("  " + text)
             b.setObjectName("nav")
             b.setCheckable(True)
-            b.setIcon(T.icon(ic, T.SIDE_TEXT, on_color="#FFFFFF"))
-            b.setIconSize(QSize(18, 18))
+            b.setFocusPolicy(Qt.FocusPolicy.TabFocus)          # рамка фокуса только при работе с клавиатуры
+            b.setIcon(T.icon(ic, T.MUTED, on_color=T.TEXT))
+            b.setIconSize(QSize(16, 16))
             b.setCursor(Qt.CursorShape.PointingHandCursor)
             b.clicked.connect(lambda _=False, i=i: self.go(i))
             lay.addWidget(b)
             self.nav.append(b)
         lay.addStretch(1)
-        self.side_status = label("", "sideSmall", wrap=True)
-        lay.addWidget(self.side_status)
-        lay.addSpacing(4)
-        lay.addWidget(label(f"Версия {__version__}", "sideSmall"))
+        status = QVBoxLayout()
+        status.setContentsMargins(12, 0, 12, 0)
+        status.setSpacing(8)
+        self.side_status = label("", "sideMeta", wrap=True)
+        status.addWidget(self.side_status)
+        status.addWidget(label(f"Версия {__version__}", "sideKey"))
+        lay.addLayout(status)
         return side
 
     def go(self, i: int) -> None:
@@ -356,19 +508,24 @@ class MainWindow(QWidget):
 
     # --- страница «Стримы» ------------------------------------------------
     def _page_streams(self) -> QWidget:
-        area, lay = page("Стримы", "Вставь ссылку на Twitch-стрим. Программа сама дождётся эфира, будет записывать "
-                                   "и вырезать моменты, на которые чат реагирует сильнее всего.")
-        stats = QHBoxLayout()
-        stats.setSpacing(12)
+        area, lay = page("Стримы", "Вставь ссылку на Twitch-канал. Программа сама дождётся эфира, будет записывать "
+                                   "и вырезать моменты, когда чат взрывается")
+        strip = QFrame()
+        strip.setObjectName("strip")
+        stats = QHBoxLayout(strip)
+        stats.setContentsMargins(0, 0, 0, 0)
+        stats.setSpacing(0)
         self.stat: dict[str, QLabel] = {}
-        for key, name in (("live", "стримов в эфире"), ("clips", "клипов сегодня"), ("queue", "ждут отправки"),
-                          ("disk", "свободно на диске")):
-            tile, value = stat_tile(name)
+        for i, (key, name) in enumerate((("live", "В эфире"), ("clips", "Клипов сегодня"), ("queue", "Ждут отправки"),
+                                         ("disk", "Свободно на диске"))):
+            if i:
+                stats.addWidget(vline())
+            cell, value = stat_cell(name)
             self.stat[key] = value
-            stats.addWidget(tile, 1)
-        lay.addLayout(stats)
+            stats.addWidget(cell, 1)
+        lay.addWidget(strip)
         row = QHBoxLayout()
-        row.setSpacing(10)
+        row.setSpacing(8)
         self.url = QLineEdit()
         self.url.setPlaceholderText("https://www.twitch.tv/имя_канала")
         self.url.returnPressed.connect(self.add_channel)
@@ -384,9 +541,10 @@ class MainWindow(QWidget):
         self.add_error.hide()
         lay.addWidget(self.add_error)
         self.streams_box = QVBoxLayout()
-        self.streams_box.setSpacing(14)
+        self.streams_box.setSpacing(12)
         lay.addLayout(self.streams_box)
         self.empty, el = card()
+        el.setSpacing(8)
         el.addWidget(label("Пока нет ни одного стрима", "h2"))
         el.addWidget(label("Скопируй ссылку на канал в браузере и вставь её в поле выше. Можно добавить несколько "
                            "стримов, они пишутся одновременно и не мешают друг другу.", "muted", wrap=True))
@@ -426,7 +584,7 @@ class MainWindow(QWidget):
         self.empty.setVisible(not snap)
         paused = bool(self.sup.cfg.get("paused"))
         self.pause_btn.setText("Продолжить" if paused else "Пауза")
-        self.pause_btn.setIcon(T.icon("play" if paused else "pause"))
+        self.pause_btn.setIcon(T.icon("play" if paused else "pause", T.TEXT_2))
         live = sum(1 for x in snap if x["state"] in ("live", "ad", "pause"))
         self.stat["live"].setText(f"{live} из {len(snap)}" if snap else "0")
         self.stat["clips"].setText(str(sum(self.sup.stats.get("made", {}).values())))
@@ -436,19 +594,22 @@ class MainWindow(QWidget):
 
     # --- страница «Клипы» -------------------------------------------------
     def _page_clips(self) -> QWidget:
-        area, lay = page("Клипы", "Все нарезанные моменты. Ставь 👍 удачным и 👎 неудачным: программа учится на твоих "
-                                  "оценках и со временем отбирает точнее. То же самое можно делать реакциями в Telegram-канале.")
+        area, lay = page("Клипы", "Все нарезанные моменты. Отмечай удачные и неудачные кнопками справа: программа "
+                                  "учится на твоих оценках и со временем отбирает точнее. То же самое можно делать "
+                                  "реакциями в Telegram-канале.")
         row = QHBoxLayout()
-        self.learn_label = label("", "muted", wrap=True)
+        row.setSpacing(16)
+        self.learn_label = label("", "small", wrap=True)
         row.addWidget(self.learn_label, 1)
         folder = button("Открыть папку", None, "folder")
         folder.clicked.connect(lambda: system.open_folder(self.sup.cfg["clips_dir"]))
         row.addWidget(folder)
         lay.addLayout(row)
-        self.clips_card, self.clips_box = card()
+        self.clips_card, self.clips_box = card(margins=(20, 4, 20, 4))
         self.clips_box.setSpacing(0)
         lay.addWidget(self.clips_card)
         lay.addStretch(1)
+        self.clip_frames: dict[str, tuple[Frame, str]] = {}
         return area
 
     def refresh_clips(self) -> None:
@@ -458,38 +619,66 @@ class MainWindow(QWidget):
         except Exception:
             clips = []
         clear(self.clips_box)
+        self.clip_frames = {}
         if not clips:
-            self.clips_box.addWidget(label("Клипов пока нет. Они появятся здесь, как только чат на каком-нибудь "
-                                           "стриме взорвётся.", "muted", wrap=True))
+            empty = label("Клипов пока нет. Они появятся здесь, как только чат на каком-нибудь стриме взорвётся.",
+                          "muted", wrap=True)
+            empty.setContentsMargins(0, 16, 0, 16)
+            self.clips_box.addWidget(empty)
             return
         for i, c in enumerate(clips):
             self.clips_box.addWidget(self._clip_row(c, last=i == len(clips) - 1))
+        self._clip_covers()
+
+    def _clip_covers(self) -> None:
+        """Обложки клипов: те, что уже готовы, ставятся сразу, остальные по мере готовности."""
+        for cid, (fr, path) in list(self.clip_frames.items()):
+            got = self.frames.clip(cid, path)
+            if got:
+                fr.show_file(got)
+                del self.clip_frames[cid]
 
     def _clip_row(self, c: dict, last: bool) -> QFrame:
         row = QFrame()
         row.setObjectName("rowLast" if last else "row")
         h = QHBoxLayout(row)
-        h.setContentsMargins(0, 11, 0, 11)
-        h.addWidget(Avatar(c["channel"], 38))
-        h.addSpacing(12)
-        v = QVBoxLayout()
-        v.setSpacing(3)
-        top = QHBoxLayout()
-        top.setSpacing(8)
+        h.setContentsMargins(0, 12, 0, 12)
+        h.setSpacing(16)
         exists = os.path.exists(c["path"])
-        t = label(c["title"] or os.path.basename(c["path"]), "title")
-        top.addWidget(t)
-        if c["kind"] != "manual":
-            top.addWidget(label(f"{c['score']}", "score"))
-        else:
-            top.addWidget(label("вручную", "chipGray"))
-        top.addStretch(1)
-        v.addLayout(top)
+        cover = Frame(c["channel"], 45, 80)
+        if exists:
+            self.clip_frames[c["id"]] = (cover, c["path"])
+        h.addWidget(cover)
+        v = QVBoxLayout()
+        v.setSpacing(4)
+        v.addStretch(1)
+        t = ElidedLabel("clipTitle")
+        t.set_full(c["title"] or os.path.basename(c["path"]))
+        v.addWidget(t)
         when = time.strftime("%d.%m %H:%M", time.localtime(c["created"]))
-        v.addWidget(label(f"{c['channel']} · {when}" + ("" if exists else " · файл удалён"), "small"))
+        v.addWidget(label(f"{c['channel']} · {when}" + ("" if exists else " · файл удалён"), "meta"))
+        v.addStretch(1)
         h.addLayout(v, 1)
+        score = QHBoxLayout()
+        score.setSpacing(8)
+        if c["kind"] != "manual":
+            m = Meter(10, 58, 8)
+            m.set((c["score"] or 0) / 100, T.TEXT_2)
+            m.setToolTip("Сила момента: насколько бурно отреагировал чат")
+            score.addWidget(m, 0, Qt.AlignmentFlag.AlignVCenter)
+            num = label(f"{c['score'] or 0:>3}", "score")
+            num.setFixedWidth(24)
+            num.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
+            score.addWidget(num)
+        else:
+            manual = label("вручную", "meta")
+            manual.setFixedWidth(90)
+            manual.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
+            score.addWidget(manual)
+        h.addLayout(score)
+        h.addSpacing(8)
         up = tool("up", "Хороший клип: таких побольше", "vote", checkable=True, on_color=T.GOOD)
-        down = tool("down", "Плохой клип: таких не надо", "voteBad", checkable=True, on_color=T.DANGER)
+        down = tool("down", "Плохой клип: таких не надо", "voteBad", checkable=True, on_color=T.BAD)
         up.setChecked(c["label"] == 1)
         down.setChecked(c["label"] == 0)
 
@@ -525,8 +714,13 @@ class MainWindow(QWidget):
                                      "Размер файла до 2 ГБ.")
         c, cl = card()
         st = QHBoxLayout()
+        st.setSpacing(0)
         st.addWidget(label("Состояние", "h2"))
-        self.tg_chip = label("выключен", "chipGray")
+        st.addSpacing(16)
+        self.tg_dot = Dot()
+        st.addWidget(self.tg_dot, 0, Qt.AlignmentFlag.AlignVCenter)
+        st.addSpacing(8)
+        self.tg_chip = label("выключен", "status")
         st.addWidget(self.tg_chip)
         st.addStretch(1)
         cl.addLayout(st)
@@ -542,13 +736,14 @@ class MainWindow(QWidget):
                            "создай приложение с любым названием и скопируй сюда api_id и api_hash.", "small", wrap=True))
         link = button("Открыть my.telegram.org", "link")
         link.clicked.connect(lambda: webbrowser.open("https://my.telegram.org/apps"))
-        cl.addWidget(link)
+        cl.addWidget(link, 0, Qt.AlignmentFlag.AlignLeft)
         self.tg_api_id = QLineEdit(str(cfg["tg_api_id"]))
         self.tg_api_id.setPlaceholderText("api_id, например 1234567")
         self.tg_api_hash = QLineEdit(str(cfg["tg_api_hash"]))
         self.tg_api_hash.setPlaceholderText("api_hash, длинная строка из букв и цифр")
         self.tg_api_hash.setEchoMode(QLineEdit.EchoMode.PasswordEchoOnEdit)
         r = QHBoxLayout()
+        r.setSpacing(8)
         r.addWidget(self.tg_api_id, 1)
         r.addWidget(self.tg_api_hash, 2)
         cl.addLayout(r)
@@ -564,9 +759,11 @@ class MainWindow(QWidget):
         self.user_box = QWidget()
         ul = QVBoxLayout(self.user_box)
         ul.setContentsMargins(0, 0, 0, 0)
+        ul.setSpacing(8)
         ul.addWidget(label("Вход как в обычный Telegram: номер, потом код из приложения. Пароль и код никуда не "
                            "отправляются, кроме самого Telegram, и хранятся только на этом компьютере.", "small", wrap=True))
         r = QHBoxLayout()
+        r.setSpacing(8)
         self.tg_phone = QLineEdit(str(cfg["tg_phone"]))
         self.tg_phone.setPlaceholderText("+79991234567")
         r.addWidget(self.tg_phone, 1)
@@ -575,6 +772,7 @@ class MainWindow(QWidget):
         r.addWidget(self.code_btn)
         ul.addLayout(r)
         r = QHBoxLayout()
+        r.setSpacing(8)
         self.tg_code = QLineEdit()
         self.tg_code.setPlaceholderText("код из Telegram")
         self.tg_pass = QLineEdit()
@@ -597,6 +795,7 @@ class MainWindow(QWidget):
         c, cl = card()
         cl.addWidget(label("Шаг 3. Куда отправлять", "h2"))
         r = QHBoxLayout()
+        r.setSpacing(8)
         self.tg_channel = QComboBox()
         self.tg_channel.setEditable(True)
         self.tg_channel.lineEdit().setPlaceholderText("@имя_канала или ссылка t.me/…")
@@ -620,6 +819,7 @@ class MainWindow(QWidget):
         lay.addWidget(c)
 
         r = QHBoxLayout()
+        r.setSpacing(8)
         save = button("Сохранить и подключиться", "primary")
         save.clicked.connect(self.tg_save)
         r.addWidget(save)
@@ -637,7 +837,7 @@ class MainWindow(QWidget):
         self.votes_lbl = label(VOTES_TEXT[""], "muted", wrap=True)
         cl.addWidget(self.votes_lbl)
         r = QHBoxLayout()
-        self.votes_btn = button("Включить оценки 👍 и 👎 в канале")
+        self.votes_btn = button("Включить реакции для оценок")
         self.votes_btn.setToolTip("Разрешает в твоём канале реакции 👍 и 👎 под сообщениями. Остальные настройки канала "
                                   "не меняются. Выключить можно в самом Telegram: канал → Изменить → Реакции")
         self.votes_btn.clicked.connect(self.tg_votes_on)
@@ -787,7 +987,7 @@ class MainWindow(QWidget):
         area, lay = page("Обучение", "Как программа выбирает моменты и чему она научилась на твоих оценках. "
                                      "Страница пишется сама: после каждой оценки сюда добавляется вывод.")
         self.learn_box = QVBoxLayout()
-        self.learn_box.setSpacing(16)
+        self.learn_box.setSpacing(12)
         lay.addLayout(self.learn_box)
         b = button("Открыть текстовым файлом", "link")
         b.setToolTip("Тот же текст одним файлом: его можно переслать или сохранить.")
@@ -814,9 +1014,11 @@ class MainWindow(QWidget):
         clear(self.learn_box)
         for title, lines in sections:
             f, cl = card()
+            cl.setSpacing(8)
             cl.addWidget(label(title, "h2"))
+            cl.addSpacing(4)
             for ln in lines:
-                cl.addWidget(label("•  " + ln, "muted", wrap=True))
+                cl.addWidget(label(ln, "muted", wrap=True))
             self.learn_box.addWidget(f)
 
     def open_bible(self) -> None:
@@ -834,17 +1036,19 @@ class MainWindow(QWidget):
         w = QWidget()
         w.setObjectName("page")
         lay = QVBoxLayout(w)
-        lay.setContentsMargins(36, 30, 36, 30)
-        lay.setSpacing(14)
+        lay.setContentsMargins(32, 28, 32, 32)
+        lay.setSpacing(8)
         lay.addWidget(label("Журнал", "h1"))
         lay.addWidget(label("Всё, что делает программа. Если что-то пошло не так, причина будет здесь.", "muted"))
+        lay.addSpacing(16)
         self.log = QPlainTextEdit()
         self.log.setReadOnly(True)
         self.log.setMaximumBlockCount(1500)
         lay.addWidget(self.log, 1)
+        lay.addSpacing(8)
         b = button("Открыть папку с подробными логами", "link")
         b.clicked.connect(lambda: system.open_folder(str(config.subdir("logs"))))
-        lay.addWidget(b)
+        lay.addWidget(b, 0, Qt.AlignmentFlag.AlignLeft)
         return w
 
     # --- страница «Настройки» ---------------------------------------------
@@ -929,12 +1133,11 @@ class MainWindow(QWidget):
 
     def _page_settings(self) -> QWidget:
         cfg = self.sup.cfg
-        area, lay = page("Настройки", "Всё уже настроено разумно, менять что-либо необязательно.")
+        area, lay = page("Настройки", "Всё уже настроено, менять что-либо необязательно")
+        lay.setSpacing(12)
         self.fields: dict[str, tuple[str, QWidget]] = {}
-        for section, rows in self.SETTINGS:
-            c, cl = card()
-            cl.setSpacing(0)
-            cl.addWidget(label(section, "h2"))
+        for head, rows in self.SETTINGS:
+            c, cl = section(head)
             for i, (key, title, desc, kind, opt) in enumerate(rows):
                 w: QWidget
                 if kind == "bool":
@@ -950,11 +1153,13 @@ class MainWindow(QWidget):
                     w = QWidget()
                     hl = QHBoxLayout(w)
                     hl.setContentsMargins(0, 0, 0, 0)
+                    hl.setSpacing(12)
                     s = QSlider(Qt.Orientation.Horizontal)
                     s.setRange(*opt)
                     s.setValue(int(cfg[key]))
-                    s.setFixedWidth(170)
-                    val = label(str(cfg[key]), "title")
+                    s.setFixedWidth(168)
+                    val = label(str(cfg[key]), "value")
+                    val.setFixedWidth(16)
                     s.valueChanged.connect(lambda v, val=val: val.setText(str(v)))
                     hl.addWidget(s)
                     hl.addWidget(val)
@@ -968,6 +1173,7 @@ class MainWindow(QWidget):
                     w = QWidget()
                     hl = QHBoxLayout(w)
                     hl.setContentsMargins(0, 0, 0, 0)
+                    hl.setSpacing(8)
                     e = QLineEdit(str(cfg[key]))
                     e.setMinimumWidth(300)
                     pick = button("Выбрать…")
@@ -984,9 +1190,7 @@ class MainWindow(QWidget):
                 self.fields[key] = (kind, w)
                 cl.addWidget(setting_row(title, desc, w, last=i == len(rows) - 1))
             lay.addWidget(c)
-        c, cl = card()
-        cl.setSpacing(0)
-        cl.addWidget(label("Обновление программы", "h2"))
+        c, cl = section("Обновление программы")
         self.check_btn = button("Проверить обновления")
         self.check_btn.clicked.connect(self.check_updates)
         how = ("сверху появится полоска с кнопкой «Обновить»: программа сама скачает новую версию, поставит её "
@@ -995,10 +1199,13 @@ class MainWindow(QWidget):
         cl.addWidget(setting_row(f"Установлена версия {__version__}", "Программа сама проверяет, не вышла ли новая: "
                                  "при запуске и дважды в сутки. Когда выйдет, " + how, self.check_btn, last=True))
         self.check_label = label("", "small", wrap=True)
+        self.check_label.setContentsMargins(0, 0, 0, 12)
         self.check_label.hide()
         cl.addWidget(self.check_label)
         lay.addWidget(c)
+        lay.addSpacing(4)
         r = QHBoxLayout()
+        r.setSpacing(16)
         save = button("Сохранить", "primary")
         save.clicked.connect(self.save_settings)
         r.addWidget(save)
@@ -1038,7 +1245,7 @@ class MainWindow(QWidget):
                 break
             t = ev.get("t")
             if t == "log":
-                self.log.appendPlainText(("⚠ " if ev.get("level") == "error" else "") + f"{ev['time']}  {ev['text']}")
+                self.log_line(ev)
             elif t in ("clip", "learned"):
                 clips_changed = True
                 if t == "clip" and self.tray and not self.isVisible():
@@ -1050,6 +1257,8 @@ class MainWindow(QWidget):
         self.refresh_streams()
         if clips_changed and self.stack.currentIndex() == 1:
             self.refresh_clips()
+        elif self.clip_frames and self.stack.currentIndex() == 1:
+            self._clip_covers()
         if self.stack.currentIndex() == self.PAGE_LEARN and time.time() - self._learn_at > 5:
             self.refresh_learn()
         tg = self.sup.tg
@@ -1059,7 +1268,10 @@ class MainWindow(QWidget):
         if self.votes_lbl.text() != VOTES_TEXT[votes]:
             self.votes_lbl.setText(VOTES_TEXT[votes])
         self.votes_btn.setVisible(votes == "off")
-        restyle(self.tg_chip, {"ok": "chip", "off": "chipGray", "connecting": "chipGray"}.get(tg.status, "chipWarn"))
+        look = {"ok": (T.GOOD, "statusGood"), "off": (T.DIM, "status"), "connecting": (T.TEXT_2, "status")}
+        dot, style = look.get(tg.status, (T.BAD, "statusBad"))
+        self.tg_dot.set_color(dot)
+        restyle(self.tg_chip, style)
         lines = [f"Telegram: {tg.status_text}" + (f", в очереди {q}" if q else "")]
         if tg.progress:
             lines.append("Отправка " + tg.progress[-28:])
@@ -1068,10 +1280,18 @@ class MainWindow(QWidget):
         held = self.sup.pacer.waiting()
         if held:
             lines.append(f"Моментов ждёт очереди: {held}")
-        lines.append(f"Свободно на диске: {self.sup.free_gb:.0f} ГБ")
+        lines.append(f"Диск: {self.sup.free_gb:.0f} ГБ свободно")
         if self.sup.cpu:
             lines.append(f"Процессор {self.sup.cpu:.0f}% · память {self.sup.ram:.0f}%")
         self.side_status.setText("\n".join(lines))
+
+    def log_line(self, ev: dict) -> None:
+        """Строка журнала: время приглушено, ошибки красные."""
+        bad = ev.get("level") == "error"
+        text = html.escape(str(ev.get("text", "")))
+        self.log.appendHtml(f'<span style="color:{T.MUTED}">{html.escape(str(ev.get("time", "")))}</span>&nbsp;&nbsp;'
+                            + (f'<span style="color:{T.BAD}">{text}</span>' if bad else
+                               f'<span style="color:{T.TEXT_2}">{text}</span>'))
 
     # --- обновление программы -----------------------------------------------
     def check_updates(self) -> None:
@@ -1188,6 +1408,7 @@ class MainWindow(QWidget):
                                             "значку возле часов.", T.app_icon(), 5000)
             return
         self.timer.stop()
+        self.frames.close()
         self.sup.shutdown(for_update=self.for_update)
         e.accept()
         QApplication.quit()
@@ -1200,6 +1421,7 @@ def main(argv: list[str]) -> int:
     app.setQuitOnLastWindowClosed(False)
     T.load_fonts()
     app.setFont(T.app_font())
+    T.apply_palette(app)
     app.setStyleSheet(T.stylesheet(str(config.data_dir())))
     if not system.single_instance():
         QMessageBox.information(None, APP_NAME, "Программа уже запущена. Ищи её значок возле часов.")
