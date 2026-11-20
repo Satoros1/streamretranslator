@@ -179,8 +179,13 @@ def process(job_path: str) -> dict:
     if not manual and not (start <= job["peak"] <= end + 1):
         return {"ok": True, "skipped": "сам момент не попал в запись"}
 
-    transcript = describe.transcribe(raw, max(lo, start - 12), min(hi, end + 6), cfg)
-    title, quote = describe.heuristic(job, transcript)
+    heard: dict = {}
+    transcript = describe.transcribe(raw, max(lo, start - 12), min(hi, end + 6), cfg,
+                                     str(job.get("lang") or ""), heard)
+    if not job.get("lang") and heard.get("lang"):
+        job["lang"] = heard["lang"]                     # по чату язык было не понять, а по речи понятно
+    lang = describe.out_lang(job, cfg)
+    title, quote = describe.heuristic(job, transcript, lang)
     desc, score = "", int(job.get("score", 0))
     if loud and job.get("kind") != "manual":           # громкий смех/крик в кадре добавляет очков
         seg = loud[int(start / FRAME): int(end / FRAME)] or [0]
@@ -234,7 +239,7 @@ def process(job_path: str) -> dict:
                 except OSError:
                     pass
         return {"ok": True, "skipped": f"в записи оказалось всего {real_dur:.0f} с видео вместо {dur:.0f}"}
-    text = describe.caption(job, title, desc, quote, score, real_dur, time.strftime("%d.%m %H:%M", when))
+    text = describe.caption(job, title, desc, quote, score, real_dur, time.strftime("%d.%m %H:%M", when), lang)
     try:
         with open(str(folder / (name + ".txt")), "w", encoding="utf-8") as f:
             f.write(text + "\n")
