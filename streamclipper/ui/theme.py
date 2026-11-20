@@ -1,8 +1,17 @@
 """Внешний вид окна.
 
-Светлая рабочая область, белые карточки с мягкой тенью, тёмное боковое меню и фиолетовый акцент
-(в тон Twitch). Шрифт Inter идёт вместе с программой, поэтому текст выглядит одинаково на любом компьютере.
-Иконки: контурные 24x24 в духе Lucide (лицензия ISC), рисуются кодом.
+Направление (по скиллу unslop, github.com/heydamir/unslop, автор Damir Sokolovsky, CC BY 4.0):
+  Программа: смотрит сразу несколько Twitch-стримов, ловит моменты, когда чат взрывается, и режет их в клипы.
+  Характер: внимательная, быстрая, с огоньком.
+  Мир: аппаратная прямого эфира ночью: стена мониторов, лампы «в эфире», индикаторы уровня.
+  Яркие места: живые кадры стримов в карточках и индикатор движа в чате.
+  Фирменная деталь: сегментный индикатор уровня, как у звукового пульта. Им показан движ в чате у стрима
+  и сила момента у клипа.
+
+Поверхности графитовые и нейтральные, акцент один: янтарный, цвет «горячего» момента. Красная точка
+значит «идёт запись», зелёный и красный в остальном несут только смысл (хорошо/плохо).
+Шрифты идут вместе с программой: Inter для интерфейса, JetBrains Mono для цифр и служебных строк.
+Иконки: контурные 24x24 в духе Lucide (лицензия ISC), линия 1.5, рисуются кодом.
 """
 from __future__ import annotations
 
@@ -10,43 +19,45 @@ import os
 from pathlib import Path
 
 from PySide6.QtCore import QByteArray, QPointF, QRectF, Qt
-from PySide6.QtGui import (QColor, QFont, QFontDatabase, QIcon, QLinearGradient, QPainter, QPainterPath, QPen,
-                           QPixmap)
-from PySide6.QtWidgets import QGraphicsDropShadowEffect, QWidget
+from PySide6.QtGui import QColor, QFont, QFontDatabase, QIcon, QPainter, QPainterPath, QPalette, QPixmap
+from PySide6.QtWidgets import QApplication
 
-BG = "#F4F4FA"
-CARD = "#FFFFFF"
-BORDER = "#E8E7F1"
-BORDER_STRONG = "#D5D3E3"
-INK = "#17151F"
-MUTED = "#6C6A7C"
-FAINT = "#9A98AB"
+# --- цвета ----------------------------------------------------------------------------------------
+SIDE = "#0F0F10"          # самая глубокая поверхность: боковое меню
+BG = "#141415"            # фон страницы
+CARD = "#19191B"          # карточка
+RAISED = "#232325"        # поле ввода, выбранный пункт меню, кнопка
+HOVER = "#2A2A2D"         # наведение на приподнятое
+PRESSED = "#1E1E20"
+TEXT = "#EDEDED"          # основной текст
+TEXT_2 = "#A1A1A6"        # второстепенный
+MUTED = "#85858B"         # подписи, служебные строки, иконки
+DIM = "#5E5E64"           # выключенное
 
-ACCENT = "#7C4DFF"
-ACCENT_2 = "#B14DFF"
-ACCENT_HOVER = "#6B3BF2"
-ACCENT_SOFT = "#F0EAFF"
-ACCENT_INK = "#4520B8"
 
-SIDE = "#15131F"
-SIDE_2 = "#1E1A30"
-SIDE_TEXT = "#A8A4BE"
-SIDE_ACTIVE = "#2B2547"
+def _rgba(hex_color: str, alpha: float) -> str:
+    c = QColor(hex_color)
+    return f"rgba({c.red()}, {c.green()}, {c.blue()}, {round(alpha * 255)})"
 
-GOOD = "#12A150"
-GOOD_SOFT = "#E2F7EA"
-LIVE = "#F0384E"
-LIVE_SOFT = "#FFE7EA"
-WARN = "#A8690C"
-WARN_SOFT = "#FFF2D2"
-DANGER = "#D1293D"
-DANGER_SOFT = "#FFE7EA"
 
-FONT = "Segoe UI"
-DISPLAY = "Segoe UI"
-GRAD = f"qlineargradient(x1:0, y1:0, x2:1, y2:0, stop:0 {ACCENT}, stop:1 {ACCENT_2})"
-GRAD_HOVER = f"qlineargradient(x1:0, y1:0, x2:1, y2:0, stop:0 {ACCENT_HOVER}, stop:1 #A03BF2)"
-HEAT = "qlineargradient(x1:0, y1:0, x2:1, y2:0, stop:0 #FFB03A, stop:1 #FF4D7D)"
+LINE = _rgba(TEXT, 0.08)        # тонкая линия-разделитель и рамка карточки
+LINE_2 = _rgba(TEXT, 0.12)      # рамка полей ввода
+LINE_3 = _rgba(TEXT, 0.24)      # рамка галочки
+
+ACCENT = "#F2A541"        # янтарный: горячий момент, выбор, фокус
+ACCENT_HI = "#F6B963"
+ON_ACCENT = "#141415"
+
+LIVE = "#E5484D"          # точка «идёт запись»
+GOOD = "#4CC38A"
+BAD = "#E5484D"
+
+# старые имена: на случай, если где-то ещё остались
+INK = TEXT
+DANGER = BAD
+
+FONT = "Inter"
+MONO = "JetBrains Mono"
 
 
 def assets() -> Path:
@@ -54,139 +65,189 @@ def assets() -> Path:
 
 
 def load_fonts() -> None:
-    """Подключает Inter из папки программы. Если его нет, остаётся системный шрифт."""
-    global FONT, DISPLAY
+    """Подключает шрифты из папки программы. Если их нет, остаются системные."""
+    global FONT, MONO
+    families: set[str] = set()
     try:
         for f in sorted((assets() / "fonts").glob("*.ttf")):
-            QFontDatabase.addApplicationFont(str(f))
+            families.update(QFontDatabase.applicationFontFamilies(QFontDatabase.addApplicationFont(str(f))))
     except OSError:
         pass
-    families = set(QFontDatabase.families())
-    FONT = next((n for n in ("Inter", "Segoe UI Variable Text", "Segoe UI", "DejaVu Sans") if n in families), FONT)
-    DISPLAY = next((n for n in ("Inter Display", FONT) if n in families), FONT)
+    families.update(QFontDatabase.families())
+    FONT = next((n for n in ("Inter", "Segoe UI Variable Text", "Segoe UI", "DejaVu Sans") if n in families), "Segoe UI")
+    MONO = next((n for n in ("JetBrains Mono", "Cascadia Mono", "Consolas", "DejaVu Sans Mono") if n in families),
+                "Consolas")
 
 
 def app_font() -> QFont:
     f = QFont(FONT)
-    f.setPointSizeF(10.5)
+    f.setPixelSize(14)
     f.setHintingPreference(QFont.HintingPreference.PreferNoHinting)
     f.setStyleStrategy(QFont.StyleStrategy.PreferAntialias)
     return f
 
 
-def shadow(w: QWidget, blur: int = 28, dy: int = 6, alpha: int = 22) -> None:
-    """Мягкая тень под карточкой."""
-    eff = QGraphicsDropShadowEffect(w)
-    eff.setBlurRadius(blur)
-    eff.setOffset(0, dy)
-    eff.setColor(QColor(40, 28, 100, alpha))
-    w.setGraphicsEffect(eff)
+def mono_font(px: int = 12, weight: QFont.Weight = QFont.Weight.Normal) -> QFont:
+    f = QFont(MONO)
+    f.setPixelSize(px)
+    f.setWeight(weight)
+    return f
+
+
+def apply_palette(app: QApplication) -> None:
+    """Цвета для того, что рисует сама система: подсказка в пустом поле, выделение, окна-вопросы."""
+    pal = app.palette()
+    for role, color in ((QPalette.ColorRole.Window, BG), (QPalette.ColorRole.WindowText, TEXT),
+                        (QPalette.ColorRole.Base, RAISED), (QPalette.ColorRole.AlternateBase, CARD),
+                        (QPalette.ColorRole.Text, TEXT), (QPalette.ColorRole.Button, RAISED),
+                        (QPalette.ColorRole.ButtonText, TEXT), (QPalette.ColorRole.ToolTipBase, RAISED),
+                        (QPalette.ColorRole.ToolTipText, TEXT), (QPalette.ColorRole.Highlight, HOVER),
+                        (QPalette.ColorRole.HighlightedText, TEXT), (QPalette.ColorRole.Link, ACCENT),
+                        (QPalette.ColorRole.PlaceholderText, MUTED)):
+        pal.setColor(role, QColor(color))
+    pal.setColor(QPalette.ColorGroup.Disabled, QPalette.ColorRole.Text, QColor(DIM))
+    pal.setColor(QPalette.ColorGroup.Disabled, QPalette.ColorRole.ButtonText, QColor(DIM))
+    pal.setColor(QPalette.ColorGroup.Disabled, QPalette.ColorRole.WindowText, QColor(DIM))
+    app.setPalette(pal)
+
+
+def _svg_file(asset_dir: str | None, name: str, body: str, stroke: str, width: float = 2.0) -> str:
+    """Картинка для стилей (галочка, стрелка списка). Пишется в папку данных один раз при запуске."""
+    if not asset_dir:
+        return "image: none;"
+    try:
+        path = os.path.join(asset_dir, name)
+        with open(path, "w", encoding="utf-8") as fh:
+            fh.write(f'<svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" fill="none" '
+                     f'stroke="{stroke}" stroke-width="{width}" stroke-linecap="round" stroke-linejoin="round">{body}</svg>')
+        return f'image: url("{path.replace(os.sep, "/")}");'
+    except OSError:
+        return "image: none;"
 
 
 def stylesheet(asset_dir: str | None = None) -> str:
-    f, d = FONT, DISPLAY
-    check = "image: none;"
-    if asset_dir:                      # галочка для чекбоксов: рисуем файл один раз
-        try:
-            path = os.path.join(asset_dir, "check.svg")
-            with open(path, "w", encoding="utf-8") as fh:
-                fh.write('<svg xmlns="http://www.w3.org/2000/svg" width="18" height="18" viewBox="0 0 24 24" fill="none" '
-                         'stroke="#FFFFFF" stroke-width="3.2" stroke-linecap="round" stroke-linejoin="round">'
-                         '<path d="M19 7 10 16l-4.5-4.5"/></svg>')
-            check = f'image: url("{path.replace(os.sep, "/")}");'
-        except OSError:
-            pass
+    f, m = FONT, MONO
+    check = _svg_file(asset_dir, "check.svg", '<path d="M19 7 10 16l-4.5-4.5"/>', ON_ACCENT, 3)
+    chevron = _svg_file(asset_dir, "chevron.svg", '<path d="m6 9 6 6 6-6"/>', MUTED, 2)
     return f"""
-* {{ font-family: "{f}", "Segoe UI", sans-serif; color: {INK}; }}
-QWidget#root, QWidget#page, QScrollArea, QScrollArea > QWidget > QWidget {{ background: {BG}; }}
+* {{ font-family: "{f}", "Segoe UI", sans-serif; color: {TEXT}; }}
+QWidget#root, QWidget#page, QScrollArea, QScrollArea > QWidget > QWidget, QStackedWidget {{ background: {BG}; }}
 QScrollArea {{ border: none; }}
-QWidget#sidebar {{ background: qlineargradient(x1:0, y1:0, x2:0, y2:1, stop:0 {SIDE}, stop:1 {SIDE_2}); }}
-QLabel {{ background: transparent; font-size: 10.5pt; }}
-QLabel#h1 {{ font-family: "{d}"; font-size: 22pt; font-weight: 700; letter-spacing: -0.4px; }}
-QLabel#h2 {{ font-family: "{d}"; font-size: 13pt; font-weight: 700; }}
-QLabel#muted {{ color: {MUTED}; font-size: 10.5pt; }}
-QLabel#small {{ color: {MUTED}; font-size: 9.5pt; }}
-QLabel#title {{ font-size: 12.5pt; font-weight: 700; }}
-QLabel#brand {{ font-family: "{d}"; font-size: 14pt; font-weight: 700; color: #FFFFFF; }}
-QLabel#sideSmall {{ color: {SIDE_TEXT}; font-size: 9pt; }}
-QLabel#error {{ color: {DANGER}; font-size: 10pt; font-weight: 500; }}
-QLabel#statValue {{ font-family: "{d}"; font-size: 19pt; font-weight: 700; }}
-QLabel#statName {{ color: {MUTED}; font-size: 9.5pt; font-weight: 500; }}
-QLabel#chip {{ background: {GOOD_SOFT}; color: {GOOD}; border-radius: 10px; padding: 3px 10px;
-              font-size: 9pt; font-weight: 600; }}
-QLabel#chipHot {{ background: {HEAT}; color: white; border-radius: 10px; padding: 3px 10px;
-                 font-size: 9pt; font-weight: 700; }}
-QLabel#chipGray {{ background: #EEEDF5; color: {MUTED}; border-radius: 10px; padding: 3px 10px;
-                  font-size: 9pt; font-weight: 600; }}
-QLabel#chipLive {{ background: {LIVE_SOFT}; color: {LIVE}; border-radius: 10px; padding: 3px 10px;
-                  font-size: 9pt; font-weight: 700; }}
-QLabel#chipWarn {{ background: {WARN_SOFT}; color: {WARN}; border-radius: 10px; padding: 3px 10px;
-                  font-size: 9pt; font-weight: 600; }}
-QLabel#score {{ background: {GRAD}; color: white; border-radius: 10px; padding: 3px 10px; font-size: 9.5pt;
-               font-weight: 700; }}
-QFrame#card {{ background: {CARD}; border: 1px solid {BORDER}; border-radius: 16px; }}
-QFrame#cardHot {{ background: {CARD}; border: 2px solid #FF7A5C; border-radius: 16px; }}
-QFrame#stat {{ background: {CARD}; border: 1px solid {BORDER}; border-radius: 14px; }}
-QFrame#updateBar {{ background: {ACCENT_SOFT}; border: none; border-bottom: 1px solid #DDD0FF; }}
-QFrame#row {{ background: transparent; border: none; border-bottom: 1px solid #F0EFF6; }}
+QWidget#sidebar {{ background: {SIDE}; border-right: 1px solid {LINE}; }}
+
+QLabel {{ background: transparent; font-size: 14px; }}
+QLabel#h1 {{ font-size: 28px; font-weight: 500; }}
+QLabel#h2 {{ font-size: 16px; font-weight: 500; }}
+QLabel#title {{ font-size: 16px; font-weight: 500; }}
+QLabel#clipTitle {{ font-size: 14px; font-weight: 500; }}
+QLabel#muted {{ color: {TEXT_2}; font-size: 14px; }}
+QLabel#small {{ color: {MUTED}; font-size: 13px; }}
+QLabel#status {{ color: {TEXT_2}; font-size: 13px; }}
+QLabel#statusHot {{ color: {ACCENT}; font-size: 13px; font-weight: 500; }}
+QLabel#statusBad {{ color: {BAD}; font-size: 13px; }}
+QLabel#statusGood {{ color: {GOOD}; font-size: 13px; }}
+QLabel#meta {{ font-family: "{m}"; color: {MUTED}; font-size: 12px; }}
+QLabel#figure {{ font-family: "{m}"; font-size: 24px; font-weight: 500; }}
+QLabel#score {{ font-family: "{m}"; color: {TEXT_2}; font-size: 12px; }}
+QLabel#value {{ font-family: "{m}"; color: {TEXT}; font-size: 14px; }}
+QLabel#brand {{ font-size: 16px; font-weight: 600; }}
+QLabel#sideMeta {{ font-family: "{m}"; color: {MUTED}; font-size: 12px; }}
+QLabel#sideKey {{ color: {MUTED}; font-size: 12px; }}
+QLabel#error {{ color: {BAD}; font-size: 13px; }}
+
+QFrame#card {{ background: {CARD}; border: 1px solid {LINE}; border-radius: 12px; }}
+QFrame#cardHot {{ background: {CARD}; border: 1px solid {_rgba(ACCENT, 0.45)}; border-radius: 12px; }}
+QFrame#strip {{ background: {CARD}; border: 1px solid {LINE}; border-radius: 12px; }}
+QFrame#vline {{ background: {LINE}; border: none; }}
+QFrame#updateBar {{ background: {CARD}; border: none; border-bottom: 1px solid {LINE}; }}
+QFrame#row {{ background: transparent; border: none; border-bottom: 1px solid {LINE}; }}
 QFrame#rowLast {{ background: transparent; border: none; }}
-QPushButton {{ font-size: 10.5pt; font-weight: 600; border-radius: 10px; padding: 9px 16px; min-height: 22px;
-              background: {CARD}; border: 1px solid {BORDER_STRONG}; }}
-QPushButton:hover {{ background: #F5F3FC; border-color: #BDB6DE; }}
-QPushButton:pressed {{ background: #ECE8F9; }}
-QPushButton:disabled {{ color: #B4B2C2; border-color: {BORDER}; background: #FAFAFD; }}
-QPushButton#primary {{ background: {GRAD}; color: white; border: none; padding: 10px 18px; }}
-QPushButton#primary:hover {{ background: {GRAD_HOVER}; }}
-QPushButton#primary:disabled {{ background: #D9D2F3; color: white; }}
-QPushButton#link {{ border: none; background: transparent; color: {ACCENT}; padding: 2px 0; font-weight: 600;
-                   text-align: left; }}
-QPushButton#link:hover {{ background: transparent; color: {ACCENT_HOVER}; text-decoration: underline; }}
-QPushButton#nav {{ text-align: left; border: none; border-radius: 10px; padding: 11px 12px; font-size: 10.5pt;
-                  font-weight: 500; color: {SIDE_TEXT}; background: transparent; }}
-QPushButton#nav:hover {{ background: #211D33; color: #FFFFFF; }}
-QPushButton#nav:checked {{ background: {SIDE_ACTIVE}; color: #FFFFFF; font-weight: 600; }}
-QToolButton {{ border: none; padding: 7px; border-radius: 9px; background: transparent; }}
-QToolButton:hover {{ background: #F1EFF8; }}
-QToolButton#vote:checked {{ background: {GOOD_SOFT}; }}
-QToolButton#voteBad:checked {{ background: {DANGER_SOFT}; }}
-QLineEdit, QSpinBox {{ background: {CARD}; border: 1px solid {BORDER_STRONG}; border-radius: 10px; padding: 9px 12px;
-            font-size: 10.5pt; selection-background-color: {ACCENT_SOFT}; selection-color: {INK}; }}
-QLineEdit:focus, QSpinBox:focus {{ border: 2px solid {ACCENT}; padding: 8px 11px; }}
-QSpinBox {{ min-width: 40px; padding: 9px 4px; font-weight: 600; }}
-QSpinBox:focus {{ padding: 8px 3px; }}
+
+QPushButton {{ font-size: 14px; font-weight: 500; border-radius: 8px; padding: 8px 16px; min-height: 20px;
+              background: {RAISED}; border: 1px solid {LINE}; color: {TEXT}; }}
+QPushButton:hover {{ background: {HOVER}; }}
+QPushButton:pressed {{ background: {PRESSED}; }}
+QPushButton:focus {{ border-color: {_rgba(ACCENT, 0.7)}; }}
+QPushButton:disabled {{ color: {DIM}; background: {CARD}; border-color: {LINE}; }}
+QPushButton#primary {{ background: {TEXT}; color: {ON_ACCENT}; border: 1px solid {TEXT}; }}
+QPushButton#primary:hover {{ background: #FFFFFF; border-color: #FFFFFF; }}
+QPushButton#primary:pressed {{ background: #D4D4D8; border-color: #D4D4D8; }}
+QPushButton#primary:focus {{ border-color: {ACCENT}; }}
+QPushButton#primary:disabled {{ background: {RAISED}; color: {DIM}; border-color: {RAISED}; }}
+QPushButton#link {{ border: none; background: transparent; color: {ACCENT}; padding: 0; min-height: 20px;
+                   font-weight: 500; text-align: left; }}
+QPushButton#link:hover {{ background: transparent; color: {ACCENT_HI}; text-decoration: underline; }}
+QPushButton#nav {{ text-align: left; border: 1px solid transparent; border-radius: 8px; padding: 0 12px;
+                  min-height: 34px; max-height: 34px; font-size: 14px; font-weight: 400; color: {TEXT_2};
+                  background: transparent; }}
+QPushButton#nav:hover {{ background: {CARD}; color: {TEXT}; }}
+QPushButton#nav:checked {{ background: {RAISED}; color: {TEXT}; font-weight: 500; border: 1px solid {LINE}; }}
+QPushButton#nav:focus {{ border-color: {_rgba(ACCENT, 0.7)}; }}
+
+QToolButton {{ border: 1px solid transparent; padding: 8px; border-radius: 8px; background: transparent; }}
+QToolButton:hover {{ background: {RAISED}; }}
+QToolButton:pressed {{ background: {PRESSED}; }}
+QToolButton:focus {{ border-color: {_rgba(ACCENT, 0.7)}; }}
+QToolButton#vote:checked {{ background: {_rgba(GOOD, 0.14)}; }}
+QToolButton#voteBad:checked {{ background: {_rgba(BAD, 0.14)}; }}
+
+QLineEdit, QSpinBox {{ background: {RAISED}; border: 1px solid {LINE_2}; border-radius: 8px; padding: 8px 12px;
+                      font-size: 14px; color: {TEXT}; selection-background-color: {_rgba(ACCENT, 0.35)};
+                      selection-color: {TEXT}; }}
+QLineEdit:hover, QSpinBox:hover {{ border-color: {LINE_3}; }}
+QLineEdit:focus, QSpinBox:focus {{ border-color: {ACCENT}; }}
+QLineEdit:disabled {{ color: {DIM}; }}
+QSpinBox {{ font-family: "{m}"; min-width: 40px; padding: 8px 4px; }}
 QSpinBox::up-button, QSpinBox::down-button {{ width: 0; height: 0; border: none; }}
-QPlainTextEdit {{ background: {CARD}; border: 1px solid {BORDER}; border-radius: 16px; padding: 12px;
-                 font-family: "Cascadia Mono", "Consolas", "DejaVu Sans Mono", monospace; font-size: 9.5pt; }}
-QComboBox {{ background: {CARD}; border: 1px solid {BORDER_STRONG}; border-radius: 10px; padding: 7px 12px;
-            font-size: 10.5pt; min-height: 22px; min-width: 150px; }}
-QComboBox:hover {{ border-color: {ACCENT}; }}
-QComboBox::drop-down {{ border: none; width: 24px; }}
-QComboBox QAbstractItemView {{ background: {CARD}; border: 1px solid {BORDER}; selection-background-color: {ACCENT_SOFT};
-                              selection-color: {INK}; outline: 0; padding: 4px; }}
-QCheckBox {{ font-size: 10.5pt; spacing: 9px; }}
-QCheckBox::indicator {{ width: 19px; height: 19px; border-radius: 6px; border: 1px solid {BORDER_STRONG}; background: {CARD}; }}
+
+QPlainTextEdit {{ background: {CARD}; border: 1px solid {LINE}; border-radius: 12px; padding: 12px;
+                 font-family: "{m}", "Consolas", monospace; font-size: 12px; color: {TEXT_2};
+                 selection-background-color: {_rgba(ACCENT, 0.35)}; selection-color: {TEXT}; }}
+
+QComboBox {{ background: {RAISED}; border: 1px solid {LINE_2}; border-radius: 8px; padding: 8px 12px;
+            font-size: 14px; min-height: 20px; min-width: 160px; color: {TEXT}; }}
+QComboBox:hover {{ border-color: {LINE_3}; }}
+QComboBox:focus {{ border-color: {ACCENT}; }}
+QComboBox::drop-down {{ border: none; width: 28px; subcontrol-origin: padding; subcontrol-position: center right; }}
+QComboBox::down-arrow {{ {chevron} width: 14px; height: 14px; }}
+QComboBox QAbstractItemView {{ background: {RAISED}; border: 1px solid {LINE_2}; outline: 0; padding: 4px;
+                              selection-background-color: {HOVER}; selection-color: {TEXT}; color: {TEXT}; }}
+
+QCheckBox {{ font-size: 14px; spacing: 8px; color: {TEXT}; }}
+QCheckBox::indicator {{ width: 16px; height: 16px; border-radius: 4px; border: 1px solid {LINE_3}; background: {RAISED}; }}
 QCheckBox::indicator:hover {{ border-color: {ACCENT}; }}
+QCheckBox::indicator:focus {{ border-color: {ACCENT}; }}
 QCheckBox::indicator:checked {{ background: {ACCENT}; border-color: {ACCENT}; {check} }}
+
 QSlider {{ min-height: 24px; background: transparent; }}
-QSlider::groove:horizontal {{ height: 5px; background: #E7E5F1; border-radius: 2px; }}
-QSlider::sub-page:horizontal {{ background: {GRAD}; border-radius: 2px; }}
-QSlider::handle:horizontal {{ background: {CARD}; border: 2px solid {ACCENT}; width: 14px; height: 14px;
-                             margin: -7px 0; border-radius: 9px; }}
-QProgressBar {{ background: #ECEBF4; border: none; border-radius: 4px; max-height: 8px; min-height: 8px; }}
-QProgressBar::chunk {{ background: {HEAT}; border-radius: 4px; }}
-QMenu {{ background: {CARD}; border: 1px solid {BORDER}; border-radius: 10px; padding: 5px; }}
-QMenu::item {{ padding: 8px 18px; border-radius: 7px; font-size: 10.5pt; }}
-QMenu::item:selected {{ background: {ACCENT_SOFT}; color: {INK}; }}
-QScrollBar:vertical {{ background: transparent; width: 12px; margin: 2px 3px; }}
-QScrollBar::handle:vertical {{ background: #D4D2E2; border-radius: 3px; min-height: 30px; }}
-QScrollBar::handle:vertical:hover {{ background: #B7B4CC; }}
+QSlider::groove:horizontal {{ height: 4px; background: {LINE_2}; border-radius: 2px; }}
+QSlider::sub-page:horizontal {{ background: {ACCENT}; border-radius: 2px; }}
+QSlider::handle:horizontal {{ background: {TEXT}; border: none; width: 14px; height: 14px; margin: -5px 0;
+                             border-radius: 7px; }}
+QSlider::handle:horizontal:hover {{ background: #FFFFFF; }}
+
+QProgressBar {{ background: {LINE_2}; border: none; border-radius: 2px; max-height: 4px; min-height: 4px; }}
+QProgressBar::chunk {{ background: {ACCENT}; border-radius: 2px; }}
+
+QMenu {{ background: {RAISED}; border: 1px solid {LINE_2}; border-radius: 8px; padding: 4px; }}
+QMenu::item {{ padding: 8px 16px; border-radius: 4px; font-size: 14px; color: {TEXT}; }}
+QMenu::item:selected {{ background: {HOVER}; }}
+
+QScrollBar:vertical {{ background: transparent; width: 12px; margin: 4px 2px; }}
+QScrollBar::handle:vertical {{ background: {_rgba(TEXT, 0.14)}; border-radius: 4px; min-height: 32px; }}
+QScrollBar::handle:vertical:hover {{ background: {_rgba(TEXT, 0.24)}; }}
 QScrollBar::add-page, QScrollBar::sub-page {{ background: transparent; }}
 QScrollBar::add-line, QScrollBar::sub-line {{ height: 0; }}
-QToolTip {{ background: {INK}; color: white; border: none; padding: 7px 9px; border-radius: 7px; font-size: 9.5pt; }}
+QScrollBar:horizontal {{ height: 0; }}
+
+QToolTip {{ background: {RAISED}; color: {TEXT}; border: 1px solid {LINE_2}; padding: 6px 8px; border-radius: 6px;
+           font-size: 13px; }}
 QDialog, QMessageBox {{ background: {BG}; }}
+QMessageBox QLabel {{ color: {TEXT}; }}
 """
 
 
+# --- иконки ---------------------------------------------------------------------------------------
 _ICONS = {
     "streams": '<path d="M4.9 19.1C1 15.2 1 8.8 4.9 4.9"/><path d="M7.8 16.2c-2.3-2.3-2.3-6.1 0-8.5"/>'
                '<circle cx="12" cy="12" r="2"/><path d="M16.2 7.8c2.3 2.3 2.3 6.1 0 8.5"/>'
@@ -210,6 +271,8 @@ _ICONS = {
             'a2 2 0 0 1-2 2h-2.76a2 2 0 0 0-1.79 1.11L12 22a3.13 3.13 0 0 1-3-3.88Z"/>',
     "refresh": '<path d="M3 12a9 9 0 0 1 9-9 9.8 9.8 0 0 1 6.7 2.7L21 8"/><path d="M21 3v5h-5"/>'
                '<path d="M21 12a9 9 0 0 1-9 9 9.8 9.8 0 0 1-6.7-2.7L3 16"/><path d="M8 16H3v5"/>',
+    "download": '<path d="M12 15V3"/><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><path d="m7 10 5 5 5-5"/>',
+    "tv": '<rect x="2" y="7" width="20" height="15" rx="2"/><path d="m17 2-5 5-5-5"/>',
 }
 _CACHE: dict = {}
 
@@ -218,7 +281,7 @@ def _pixmap(name: str, color: str, px: int) -> QPixmap:
     from PySide6.QtSvg import QSvgRenderer
 
     svg = (f'<svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" fill="none" '
-           f'stroke="{color}" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">{_ICONS[name]}</svg>')
+           f'stroke="{color}" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round">{_ICONS[name]}</svg>')
     pm = QPixmap(px, px)
     pm.fill(Qt.GlobalColor.transparent)
     p = QPainter(pm)
@@ -228,73 +291,88 @@ def _pixmap(name: str, color: str, px: int) -> QPixmap:
     return pm
 
 
-def icon(name: str, color: str = INK, size: int = 18, on_color: str | None = None) -> QIcon:
-    """Иконка. on_color: цвет для нажатого (выбранного) состояния кнопки."""
-    key = (name, color, size, on_color)
+def icon(name: str, color: str = TEXT_2, size: int = 16, on_color: str | None = None,
+         off_color: str | None = None) -> QIcon:
+    """Иконка. on_color: цвет для нажатого (выбранного) состояния, off_color: для выключенной кнопки."""
+    key = (name, color, size, on_color, off_color)
     if key in _CACHE:
         return _CACHE[key]
     out = QIcon()
-    for scale in (1, 2):
-        pm = _pixmap(name, color, size * scale)
-        pm.setDevicePixelRatio(scale)
-        out.addPixmap(pm, QIcon.Mode.Normal, QIcon.State.Off)
-        if on_color:
-            pm2 = _pixmap(name, on_color, size * scale)
-            pm2.setDevicePixelRatio(scale)
-            out.addPixmap(pm2, QIcon.Mode.Normal, QIcon.State.On)
+    for scale in (1, 2, 3):
+        for col, mode, state in ((color, QIcon.Mode.Normal, QIcon.State.Off),
+                                 (on_color, QIcon.Mode.Normal, QIcon.State.On),
+                                 (off_color or DIM, QIcon.Mode.Disabled, QIcon.State.Off)):
+            if col:
+                pm = _pixmap(name, col, size * scale)
+                pm.setDevicePixelRatio(scale)
+                out.addPixmap(pm, mode, state)
     _CACHE[key] = out
     return out
 
 
-def tile_colors(seed: str) -> tuple[QColor, QColor]:
-    """Два цвета для плитки канала. У одного и того же канала цвет всегда один."""
-    pairs = [("#7C4DFF", "#B14DFF"), ("#FF6A3D", "#FF3D77"), ("#0FA3B1", "#3D7BFF"), ("#12A150", "#7BC61A"),
-             ("#F0384E", "#FF7A5C"), ("#3D5AFE", "#7C4DFF"), ("#E0A100", "#FF6A3D"), ("#D63DB5", "#7C4DFF")]
-    a, b = pairs[sum(ord(c) for c in seed) % len(pairs)]
-    return QColor(a), QColor(b)
-
-
-def draw_tile(p: QPainter, rect: QRectF, text: str, seed: str, radius: float) -> None:
-    a, b = tile_colors(seed)
-    g = QLinearGradient(rect.topLeft(), rect.bottomRight())
-    g.setColorAt(0, a)
-    g.setColorAt(1, b)
+# --- рисунки --------------------------------------------------------------------------------------
+def meter(p: QPainter, rect: QRectF, level: float, segments: int, lit: str, gap: float = 2.0) -> None:
+    """Сегментный индикатор уровня, как на звуковом пульте. Горят сегменты слева, пустые едва видны."""
+    level = max(0.0, min(1.0, level))
+    w = (rect.width() - gap * (segments - 1)) / segments
+    on = round(level * segments)
+    if level > 0.02 and on == 0:
+        on = 1                                         # хоть что-то в чате есть: один сегмент горит
     p.setPen(Qt.PenStyle.NoPen)
-    p.setBrush(g)
+    off = QColor(TEXT)
+    off.setAlphaF(0.08)
+    color = QColor(lit)
+    for i in range(segments):
+        x = rect.left() + i * (w + gap)
+        p.setBrush(color if i < on else off)
+        p.drawRoundedRect(QRectF(x, rect.top(), w, rect.height()), 1, 1)
+
+
+def monogram(p: QPainter, rect: QRectF, text: str, radius: float) -> None:
+    """Плитка с первой буквой канала: когда кадра со стрима ещё нет."""
+    p.setPen(Qt.PenStyle.NoPen)
+    p.setBrush(QColor(RAISED))
     p.drawRoundedRect(rect, radius, radius)
-    f = QFont(DISPLAY)
-    f.setPixelSize(int(rect.height() * 0.46))
-    f.setWeight(QFont.Weight.Bold)
+    f = QFont(FONT)
+    f.setPixelSize(max(10, int(rect.height() * 0.36)))
+    f.setWeight(QFont.Weight.Medium)
     p.setFont(f)
-    p.setPen(QColor("#FFFFFF"))
+    p.setPen(QColor(MUTED))
     p.drawText(rect, Qt.AlignmentFlag.AlignCenter, text)
 
 
-def draw_logo(size: int) -> QPixmap:
-    """Фиолетовый квадрат с градиентом, белый треугольник «плей» и линия реза через него."""
+def _cut_play(s: float, color: QColor, inset: float) -> QPainterPath:
+    """Знак программы: треугольник «плей», разрезанный вертикальной щелью, как клип, вырезанный из эфира."""
+    left, right, top, bottom = inset + s * 0.06, s - inset, inset, s - inset
+    mid_y = (top + bottom) / 2
+    cut, gap = left + (right - left) * 0.46, s * 0.08
+    tri = QPainterPath()
+    tri.moveTo(left, top)
+    tri.lineTo(right, mid_y)
+    tri.lineTo(left, bottom)
+    tri.closeSubpath()
+    slit = QPainterPath()
+    slit.addRect(QRectF(cut - gap / 2, 0, gap, s))
+    return tri.subtracted(slit)
+
+
+def draw_logo(size: int, tile: bool = True) -> QPixmap:
+    """Значок программы: янтарный разрезанный «плей». tile: на графитовой плитке (значок окна и ярлыка)."""
     pm = QPixmap(size, size)
     pm.fill(Qt.GlobalColor.transparent)
     p = QPainter(pm)
     p.setRenderHint(QPainter.RenderHint.Antialiasing)
     s = float(size)
-    g = QLinearGradient(QPointF(0, 0), QPointF(s, s))
-    g.setColorAt(0, QColor(ACCENT))
-    g.setColorAt(1, QColor("#D04DFF"))
+    if tile:
+        p.setPen(Qt.PenStyle.NoPen)
+        p.setBrush(QColor(CARD))
+        p.drawRoundedRect(QRectF(0, 0, s, s), s * 0.22, s * 0.22)
+        inset = s * 0.25
+    else:
+        inset = s * 0.08
     p.setPen(Qt.PenStyle.NoPen)
-    p.setBrush(g)
-    p.drawRoundedRect(QRectF(0, 0, s, s), s * 0.26, s * 0.26)
-    tri = QPainterPath()
-    tri.moveTo(s * 0.36, s * 0.27)
-    tri.lineTo(s * 0.76, s * 0.5)
-    tri.lineTo(s * 0.36, s * 0.73)
-    tri.closeSubpath()
-    p.setBrush(QColor("#FFFFFF"))
-    p.setPen(QPen(QColor("#FFFFFF"), s * 0.06, Qt.PenStyle.SolidLine, Qt.PenCapStyle.RoundCap, Qt.PenJoinStyle.RoundJoin))
-    p.drawPath(tri)
-    if size >= 24:
-        pen = QPen(QColor("#9A4DFF"), max(1.5, s * 0.055), Qt.PenStyle.DashLine, Qt.PenCapStyle.RoundCap)
-        p.setPen(pen)
-        p.drawLine(QPointF(s * 0.52, s * 0.16), QPointF(s * 0.52, s * 0.84))
+    p.setBrush(QColor(ACCENT))
+    p.drawPath(_cut_play(s, QColor(ACCENT), inset))
     p.end()
     return pm
 

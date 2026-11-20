@@ -71,3 +71,20 @@ def open_folder(path: str) -> None:
     else:
         import subprocess
         subprocess.Popen(["xdg-open", path], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+
+def dark_title_bar(hwnd: int) -> None:
+    """Тёмная полоса заголовка окна в Windows 10 и 11, в цвет программы. В других системах ничего не делает."""
+    if sys.platform != "win32":
+        return
+    try:
+        import ctypes
+        dwm = ctypes.windll.dwmapi
+        on = ctypes.c_int(1)
+        for attr in (20, 19):               # DWMWA_USE_IMMERSIVE_DARK_MODE: 20 в новых Windows, 19 в старых
+            if dwm.DwmSetWindowAttribute(hwnd, attr, ctypes.byref(on), ctypes.sizeof(on)) == 0:
+                break
+        caption = ctypes.c_int(0x00100F0F)  # DWMWA_CAPTION_COLOR (Windows 11), цвет бокового меню #0F0F10
+        dwm.DwmSetWindowAttribute(hwnd, 35, ctypes.byref(caption), ctypes.sizeof(caption))
+    except Exception:
+        pass

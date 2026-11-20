@@ -302,6 +302,6 @@ class Learner:
         m = self.model()
         nwords = sum(len(v.get("pos", [])) + len(v.get("neg", [])) for v in (m.get("words") or {}).values())
         if good + bad == 0:
-            return "Обучение: оценок пока нет. Ставь 👍/👎 клипам, и отбор будет подстраиваться под тебя"
+            return "Обучение: оценок пока нет. Отмечай клипы кнопками справа, и отбор будет подстраиваться под тебя"
         state = "модель работает" if m.get("labels", 0) >= MIN_LABELS else f"до включения модели ещё {MIN_LABELS - m.get('labels', 0)} оценок"
-        return f"Обучение: 👍 {good} · 👎 {bad} · выучено слов чата: {nwords} · {state}"
+        return f"Обучение: хороших клипов {good}, плохих {bad} · выучено слов чата: {nwords} · {state}"
