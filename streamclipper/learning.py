@@ -44,8 +44,16 @@ def tokenize(text: str) -> set[str]:
 
 _STOP = set("""это что как так вот ну да нет не на по за из от до для при был была было есть его её ее их там тут
 ещё еще уже все всё кто где когда если или тоже же бы то он она они оно мы вы ты мне меня тебя тебе нас вас
-мой твой свой этот эта эти тот чем чтобы почему зачем очень просто надо можно будет быть себя сам the and for you
-that this with are was not but have what""".split())
+мой твой свой этот эта эти тот чем чтобы почему зачем очень просто надо можно будет быть себя сам""".split())
+# английский чат: служебные и самые частые слова, ими реагируют на что угодно, а не на удачный момент
+_STOP |= set("""the and for you your youre that this with are was were not but have has had what why how who when
+where which while his her him she they them their there here its can cant don dont didn doesn isn wasn aren won
+just like get got really one all out about yeah yes yea yep nope too very been from will would could should then
+than now some any more much many also only even still back did does doing going gonna wanna gotta know think see
+look want make made need say said tell guy guys chat game play playing played stream streamer time good bad man
+well okay our into over after before again never ever every thing things something nothing everything way let lets
+these those because cause cuz right left new old first last next actually literally maybe sure please thanks thank
+people someone everyone today tonight tomorrow day week year""".split())
 
 
 def learnable(token: str) -> bool:

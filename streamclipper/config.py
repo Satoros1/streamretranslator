@@ -71,6 +71,9 @@ DEFAULTS: dict = {
     # распознавание речи и ИИ
     "whisper": True,
     "whisper_model": "small",
+    # язык
+    "stream_lang": "auto",      # auto: каждый канал по своему чату; ru или en: все стримы на этом языке
+    "descr_lang": "ru",         # ru: заголовки и описания всегда по-русски; stream: на языке стрима
     "ai_enabled": False,
     "ai_api_key": "",
     "ai_model": "claude-haiku-5-5",
