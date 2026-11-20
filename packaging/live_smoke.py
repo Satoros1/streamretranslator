@@ -17,13 +17,14 @@ sys.stdout.reconfigure(encoding="utf-8", errors="replace")     # в Windows вы
 
 FALLBACK = ["buster", "evelone2004", "bratishkinoff", "zubarefff", "recrent", "stray228", "dmitry_lixxx",
             "by_owl", "t2x2", "mazellovvv", "pokanoname", "hellyeahplay"]
+FALLBACK_EN = ["kaicenat", "xqc", "jynxzi", "caseoh_", "summit1g", "tarik", "shroud", "hasanabi"]
 
 
-def live_ru(n: int = 4) -> list[str]:
-    """Самые популярные русскоязычные стримы прямо сейчас. Пробуем два варианта запроса."""
+def live_ru(n: int = 4, lang: str = "RU") -> list[str]:
+    """Самые популярные стримы на этом языке прямо сейчас (RU или EN). Пробуем два варианта запроса."""
     queries = [
-        "query{streams(first:%d, options:{broadcasterLanguages:[RU]}){edges{node{broadcaster{login} viewersCount}}}}" % n,
-        "query{streams(first:%d, languages:[RU]){edges{node{broadcaster{login} viewersCount}}}}" % n,
+        "query{streams(first:%d, options:{broadcasterLanguages:[%s]}){edges{node{broadcaster{login} viewersCount}}}}" % (n, lang),
+        "query{streams(first:%d, languages:[%s]){edges{node{broadcaster{login} viewersCount}}}}" % (n, lang),
     ]
     for q in queries:
         req = urllib.request.Request("https://gql.twitch.tv/gql", data=json.dumps({"query": q}).encode(),
@@ -32,7 +33,7 @@ def live_ru(n: int = 4) -> list[str]:
         try:
             d = json.load(urllib.request.urlopen(req, timeout=20))
             edges = [e["node"] for e in d["data"]["streams"]["edges"] if e["node"].get("broadcaster")]
-            print("live RU streams from Twitch:", [(e["broadcaster"]["login"], e["viewersCount"]) for e in edges])
+            print("live %s streams from Twitch:" % lang, [(e["broadcaster"]["login"], e["viewersCount"]) for e in edges])
             if edges:
                 return [e["broadcaster"]["login"] for e in edges]
         except Exception as e:
@@ -81,7 +82,20 @@ def main() -> int:
     with open(os.path.join(home, "config.json"), "w", encoding="utf-8") as f:
         json.dump({"clips_dir": clips, "whisper": True, "whisper_model": "base", "manual_len": 30,
                    "auto_update_streamlink": True, "max_streams": 8, "clip_format": "both"}, f)
-    channels = sys.argv[3:] or (live_ru(6) or FALLBACK)[:6]
+    # SMOKE_LANG: ru (по умолчанию), en или mix (три русских и три английских: язык каждого программа должна понять сама)
+    want = (os.environ.get("SMOKE_LANG") or "ru").lower()
+    expect: dict[str, str] = {}
+    if sys.argv[3:]:
+        channels = sys.argv[3:]
+    elif want == "en":
+        channels = (live_ru(6, "EN") or FALLBACK_EN)[:6]
+        expect = {c: "en" for c in channels}
+    elif want == "mix":
+        ru, en = (live_ru(3) or FALLBACK)[:3], (live_ru(3, "EN") or FALLBACK_EN)[:3]
+        channels, expect = ru + en, dict({c: "ru" for c in ru}, **{c: "en" for c in en})
+    else:
+        channels = (live_ru(6) or FALLBACK)[:6]
+        expect = {c: "ru" for c in channels}
     print("channels:", channels)
     env = dict(os.environ, STREAMCLIPPER_HOME=home, PYTHONIOENCODING="utf-8", PYTHONUTF8="1")
     cmd = exe.split() + ["headless", seconds] + channels
@@ -168,10 +182,22 @@ def main() -> int:
     made = sorted({os.path.basename(os.path.dirname(os.path.dirname(p))) for p in found})
     missing = [c for c in channels if c.lower() not in made]
     print("channels with clips: %d of %d" % (len(made), len(channels)), "| without:", missing or "none")
+    # Язык: программа сама понимает его по чату каждого стрима. Последняя запись в журнале канала.
+    wrong_lang = []
+    for c in channels:
+        said = ""
+        for log in glob.glob(os.path.join(home, "logs", "worker_%s.log*" % c)):
+            with open(log, encoding="utf-8", errors="replace") as f:
+                said = (re.findall(r"язык стрима: (\S+)", f.read()) or [said])[-1]
+        print("LANG %s: %s (expected %s)" % (c, said or "?", expect.get(c, "?")))
+        if c in expect and said in ("ru", "en") and said != expect[c]:
+            wrong_lang.append(c)
+    print("language guessed wrong on:", wrong_lang or "none")
     lossy = lost_video(home) + jumpy_clips(found)
     print("video lost on the way to disk or inside clips:", lossy or "none")
     # один канал мог как раз уйти на рекламу или закончить стрим
-    good = bool(found) and len(missing) <= 1 and not lossy and not stuck and (not cap or bool(lowered))
+    good = (bool(found) and len(missing) <= 1 and not lossy and not stuck and (not cap or bool(lowered))
+            and not wrong_lang)
     print("LIVE SMOKE:", "PASSED, clips: %d" % len(found) if good else "FAILED, clips: %d" % len(found))
     return 0 if good else 1
 

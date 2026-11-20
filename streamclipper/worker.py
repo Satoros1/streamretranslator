@@ -26,6 +26,7 @@ from . import config, mp4stream, netmeter, segments, util
 from .chat import ChatClient
 from .detector import WARMUP, Detector, Event, strength
 from .learning import Learner, learnable, tokenize
+from .lexicon import LangGuess
 
 log = logging.getLogger("worker")
 
@@ -53,6 +54,8 @@ class Worker:
         self.learner = Learner()
         self._apply_learning()
         self.det_lock = threading.Lock()
+        self.langs = LangGuess()                         # на каком языке этот чат: для речи и описания клипа
+        self._lang_said = ""
         self.stop = threading.Event()
         self.cmds: queue.Queue = queue.Queue()
         self.out_lock = threading.Lock()
@@ -132,9 +135,15 @@ class Worker:
             pass
         self.stop.set()        # главный процесс закрылся: выходим, сиротами не остаёмся
 
+    def lang(self) -> str:
+        """Язык стрима: из настроек, если там он задан, иначе как пишет чат. '' = пока не понять."""
+        want = str(self.cfg.get("stream_lang") or "auto")
+        return want if want in ("ru", "en") else self.langs.lang
+
     def _on_chat(self, t: float, user: str, text: str, meta: dict | None = None) -> None:
         with self.det_lock:
             self.det.add_message(t, user, text)
+            self.langs.add(text)
         meta = meta or {}
         with self.chat_lock:
             self.chatlog.append((t, user, meta.get("name") or user, meta.get("color", ""), text,
@@ -551,6 +560,7 @@ class Worker:
             job = {
                 "id": cid, "channel": self.channel, "raw": str(raw), "raw_start": raw_start,
                 "raw_dur": segs[-1].end - raw_start, "title": self.title, "category": self.category,
+                "lang": self.lang(),
                 "kind": "manual" if ev is None else ev.kind,
                 # авто-клипы не должны повторять друг друга; ручной клип берём целиком, как просили
                 "not_before": 0.0 if ev is None else max(0.0, self.last_clip_end - raw_start),
@@ -672,10 +682,14 @@ class Worker:
             if n % 2 == 0:
                 with self.det_lock:                      # для страницы «Обучение»: планка чата и что отсеяно
                     bar, skips = self.det.rare_bar(now), dict(self.det.skipped)
+                lang = self.lang()
+                if lang != self._lang_said:
+                    self._lang_said = lang
+                    log.info("язык стрима: %s", lang or "пока не понятен")
                 self.emit(t="status", state=self.state, detail=self.detail, rate=round(rate, 1),
                           level=round(level, 2), hot=hot, buf_mb=round(self.buf_bytes / 1e6),
                           chat=self.chat.connected, title=self.title, quality=self.quality, slow=self.slow,
-                          bar=round(bar, 1) if bar else 0, skips=skips)
+                          bar=round(bar, 1) if bar else 0, skips=skips, lang=lang)
         self.chat.stop()
         time.sleep(0.3)
         return 0
@@ -716,12 +730,20 @@ def _fake_chat(worker: Worker) -> None:
     burst_at = float(os.environ.get("STREAMCLIPPER_FAKE_CHAT") or 95)
     t0 = time.time()
     rng = random.Random(7)
-    calm = ["привет", "какая игра", "го катку", "норм", "стример топ", "да", "нет", "когда турнир",
-            "а что за музыка играет?", "@strimer глянь донат", "всем привет из Казани 👋"]
-    fun = ["АХАХАХАХ", "ахахах", "KEKW", "ору", "пхпхпх", "что он несёт АХАХА", "LUL", "в нарезку",
-           "АХАХАХАХАХАХАХ я не могу", "это лучший момент за весь стрим", "ХАХАХАХА 😂😂😂", "нарезчики, работаем"]
-    names = ["Vasya_Pro", "котик_228", "DedInside", "n1ghtm4re", "Лёха", "mamkin_gamer", "xX_Sniper_Xx", "Ириска",
-             "tapok", "Kekster", "бублик", "zxc_ghoul", "Sanya1337", "pelmen", "Олежа", "moonlight"]
+    if os.environ.get("STREAMCLIPPER_FAKE_CHAT_LANG") == "en":     # английский чат
+        calm = ["hi chat", "what game is this", "how long has he been live", "this map is so big", "yes", "no",
+                "when is the tournament", "what song is this?", "@streamer check the donation", "hello from Texas 👋"]
+        fun = ["LMAOOOO", "hahahaha", "KEKW", "I'm dead 💀", "OMEGALUL", "what is he saying LMAO", "LUL", "clip it",
+               "HAHAHAHA I CANT", "this is the best moment of the stream", "😭😭😭", "CLIP THAT"]
+        names = ["DankMemer", "xX_Sniper_Xx", "jessie", "n1ghtm4re", "TexasTom", "moonlight", "kappa_king", "Lily",
+                 "tapok", "Kekster", "ratjammer", "pogchampion", "Sam1337", "noodle", "Olly", "chatter99"]
+    else:
+        calm = ["привет", "какая игра", "го катку", "норм", "стример топ", "да", "нет", "когда турнир",
+                "а что за музыка играет?", "@strimer глянь донат", "всем привет из Казани 👋"]
+        fun = ["АХАХАХАХ", "ахахах", "KEKW", "ору", "пхпхпх", "что он несёт АХАХА", "LUL", "в нарезку",
+               "АХАХАХАХАХАХАХ я не могу", "это лучший момент за весь стрим", "ХАХАХАХА 😂😂😂", "нарезчики, работаем"]
+        names = ["Vasya_Pro", "котик_228", "DedInside", "n1ghtm4re", "Лёха", "mamkin_gamer", "xX_Sniper_Xx", "Ириска",
+                 "tapok", "Kekster", "бублик", "zxc_ghoul", "Sanya1337", "pelmen", "Олежа", "moonlight"]
     colors = ["#FF4500", "#1E90FF", "#9ACD32", "#FF69B4", "#8A2BE2", "#00FF7F", "#DAA520", "", "#0000FF", "#B22222"]
     worker.chat.connected = True
     while not worker.stop.is_set():

@@ -14,11 +14,26 @@ log = logging.getLogger("describe")
 
 # Whisper на музыке и тишине любит выдумывать такие фразы. Выкидываем.
 _HALLU = re.compile(r"субтитр|продолжение следует|редактор субтитров|корректор|dimatorzok|"
-                    r"спасибо за просмотр|подписывайтесь на канал|ставьте лайк", re.I)
+                    r"спасибо за просмотр|подписывайтесь на канал|ставьте лайк|"
+                    r"thanks? (?:you )?(?:so much )?for watching|please subscribe|like and subscribe|subscribe to (?:my|the|our) channel|"
+                    r"subtitles by|amara\.org|transcribed by|see you (?:in the|next) (?:next )?video", re.I)
+
+LANGS = ("ru", "en")      # на каких языках программа понимает стримы
 
 
-def transcribe(raw: str, start: float, end: float, cfg: dict) -> list[tuple[float, float, str]]:
-    """Русская речь в куске [start, end]. Возвращает [(с, по, текст)] во времени исходника."""
+def out_lang(job: dict, cfg: dict) -> str:
+    """На каком языке писать заголовок и описание клипа: по-русски, или на языке стрима, если так выбрано."""
+    if cfg.get("descr_lang") == "stream" and job.get("lang") in LANGS:
+        return job["lang"]
+    return "ru"
+
+
+def transcribe(raw: str, start: float, end: float, cfg: dict, lang: str = "ru",
+               info: dict | None = None) -> list[tuple[float, float, str]]:
+    """Речь в куске [start, end]. Возвращает [(с, по, текст)] во времени исходника.
+
+    lang: язык стрима ('ru', 'en'); пустой = неизвестен, Whisper определит сам и положит его в info["lang"].
+    """
     if not cfg.get("whisper"):
         return []
     try:
@@ -38,14 +53,20 @@ def transcribe(raw: str, start: float, end: float, cfg: dict) -> list[tuple[floa
         model = WhisperModel(cfg.get("whisper_model") or "small", device="cpu", compute_type="int8",
                              download_root=str(config.subdir("models")),
                              cpu_threads=max(2, min(6, (os.cpu_count() or 4) // 2)))
-        kw = dict(language="ru", beam_size=2, condition_on_previous_text=False)
+        kw = dict(language=lang if lang in LANGS else None, beam_size=2, condition_on_previous_text=False)
         try:
-            segs, _info = model.transcribe(audio, vad_filter=True, **kw)
+            segs, found = model.transcribe(audio, vad_filter=True, **kw)
             segs = list(segs)
         except Exception as e:
             log.info("распознавание с отсевом тишины не вышло (%s), пробую без него", e)
-            segs, _info = model.transcribe(audio, vad_filter=False, **kw)
+            segs, found = model.transcribe(audio, vad_filter=False, **kw)
             segs = list(segs)
+        if kw["language"] is None:
+            said = getattr(found, "language", "") or ""
+            sure = float(getattr(found, "language_probability", 0) or 0)
+            log.info("язык речи определён сам: %s (уверенность %.2f)", said or "?", sure)
+            if info is not None and said in LANGS and sure >= 0.6:
+                info["lang"] = said
         out = []
         for s in segs:
             text = (s.text or "").strip()
@@ -71,6 +92,34 @@ SYSTEM = """Ты редактор нарезок с русскоязычных T
 4. Оценить, насколько это смешно/залипательно для зрителя нарезок, от 0 до 100.
 Не выдумывай: пиши только то, что видно из текста и кадров. Если это не момент, а просто спам, реклама, бот \
 или ничего не понятно, поставь keep=false."""
+
+# Английский стрим, а заголовок и описание по-русски (так по умолчанию: канал владельца русский)
+SYSTEM_EN_RU = SYSTEM.replace("с русскоязычных Twitch-стримов", "с англоязычных Twitch-стримов").replace(
+    "Иногда к этому приложены", "Стрим на английском: расшифровка и чат тоже. Заголовок и описание всё равно пиши "
+    "по-русски, своими словами, а не дословным переводом; имена, названия игр и мемы вроде W или LMAO можно оставить "
+    "как есть. Иногда к этому приложены")
+
+SYSTEM_EN = """You edit highlight clips from English-language Twitch streams for TikTok. You get a piece of a stream: \
+what the streamer said (the transcript may contain mistakes) and what chat wrote, with seconds from the start of the \
+piece. Sometimes frames from the same piece are attached, each labelled with its second.
+Chat reacted to something funny or unexpected. Your job:
+1. Understand what happened and pick ONE continuous segment without cuts that hooks the viewer: a short lead-in, \
+the moment itself, the reaction. Trim a boring start and a dragging tail.
+2. Write a title. It is shown in large letters above the video, like in TikTok highlight clips, and must briefly \
+name what happens on screen so the viewer wants to watch to the end. Examples: "stealing a wheelchair in gta 6", \
+"streamer lost everything in 10 seconds". Up to 45 characters, in English, no quotes, emoji, hashtags or final period.
+3. Write a description of one or two sentences, in English, in a lively voice, without retelling the obvious.
+4. Rate from 0 to 100 how funny or gripping this is for someone watching highlight clips.
+Don't make things up: write only what the text and frames show. If this is not a moment but just spam, an ad, \
+a bot, or nothing is clear, set keep=false."""
+
+
+def system_prompt(stream_lang: str, out: str) -> str:
+    """Задание для ИИ под язык стрима и язык, на котором нужен ответ."""
+    if out == "en":
+        return SYSTEM_EN
+    return SYSTEM_EN_RU if stream_lang == "en" else SYSTEM
+
 
 SHOTS = 8             # сколько кадров показать ИИ
 SHOT_W = 640          # ширина кадра: хватает, чтобы понять происходящее, и почти ничего не стоит
@@ -110,6 +159,35 @@ def ai_content(user: str, pics: list[tuple[float, bytes]]):
     return content
 
 
+# Текст запроса к ИИ. Для ответа по-английски и сам запрос по-английски: иначе модель тянет на русский.
+_ASK = {
+    "ru": {
+        "head": "Канал: {channel}\nНазвание стрима: {title}\nКатегория: {category}\n",
+        "manual": ("Этот отрезок владелец вырезал сам, кнопкой: от {a:.0f} до {b:.0f} секунды. Границы "
+                   "менять нельзя: верни их как есть, keep=true. Нужны заголовок, описание и оценка.\n\n"),
+        "auto": ("Чат начал реагировать на {onset:.0f}-й секунде, пик на {peak:.0f}-й, утих на {end:.0f}-й.\n"
+                 "Можно выбрать отрезок в пределах от {lo:.0f} до {hi:.0f} секунды, длиной от {mn} до {mx} секунд. "
+                 "Предварительный выбор: {a:.0f}-{b:.0f}.\n\n"),
+        "body": "СТРИМЕР ГОВОРИЛ:\n{said}\n\nЧАТ ПИСАЛ:\n{chat}",
+        "nospeech": "(речь не распознана)", "empty": "(пусто)",
+        "taste": "\n\nВКУС ВЛАДЕЛЬЦА (учитывай при оценке).",
+        "liked": "\nПонравилось:\n- ", "disliked": "\nНе понравилось:\n- ",
+    },
+    "en": {
+        "head": "Channel: {channel}\nStream title: {title}\nCategory: {category}\n",
+        "manual": ("The owner cut this segment by hand, with a button: from second {a:.0f} to second {b:.0f}. Do not "
+                   "change the bounds: return them as they are, keep=true. Title, description and score are needed.\n\n"),
+        "auto": ("Chat started reacting at second {onset:.0f}, peaked at {peak:.0f}, calmed down at {end:.0f}.\n"
+                 "You may pick a segment between second {lo:.0f} and {hi:.0f}, from {mn} to {mx} seconds long. "
+                 "Preliminary pick: {a:.0f}-{b:.0f}.\n\n"),
+        "body": "THE STREAMER SAID:\n{said}\n\nCHAT WROTE:\n{chat}",
+        "nospeech": "(no speech recognized)", "empty": "(empty)",
+        "taste": "\n\nTHE OWNER'S TASTE (take it into account when scoring).",
+        "liked": "\nLiked:\n- ", "disliked": "\nDisliked:\n- ",
+    },
+}
+
+
 def ai_verdict(job: dict, transcript, lo: float, hi: float, cur: tuple[float, float], cfg: dict) -> dict | None:
     """Спрашивает модель. Возвращает dict или None, если ИИ выключен/недоступен."""
     if not (cfg.get("ai_enabled") and cfg.get("ai_api_key")):
@@ -127,28 +205,26 @@ def ai_verdict(job: dict, transcript, lo: float, hi: float, cur: tuple[float, fl
             score: int
 
         manual = job.get("kind") == "manual"
-        said = "\n".join(f"[{a:.0f}-{b:.0f}] {t}" for a, b, t in transcript) or "(речь не распознана)"
+        lang = out_lang(job, cfg)
+        T = _ASK[lang]
+        said = "\n".join(f"[{a:.0f}-{b:.0f}] {t}" for a, b, t in transcript) or T["nospeech"]
         chat = [c for c in job.get("chat", []) if lo - 5 <= c[0] <= hi + 5]
         step = max(1, len(chat) // 150)                       # не больше ~150 сообщений
         chat_txt = "\n".join(f"[{c[0]:.0f}] {c[1]}: {c[2][:120]}" for c in chat[::step])
-        user = (f"Канал: {job['channel']}\nНазвание стрима: {job.get('title') or '?'}\n"
-                f"Категория: {job.get('category') or '?'}\n")
+        user = T["head"].format(channel=job["channel"], title=job.get("title") or "?", category=job.get("category") or "?")
         if manual:
-            user += (f"Этот отрезок владелец вырезал сам, кнопкой: от {cur[0]:.0f} до {cur[1]:.0f} секунды. Границы "
-                     f"менять нельзя: верни их как есть, keep=true. Нужны заголовок, описание и оценка.\n\n")
+            user += T["manual"].format(a=cur[0], b=cur[1])
         else:
-            user += (f"Чат начал реагировать на {job['onset']:.0f}-й секунде, пик на {job['peak']:.0f}-й, "
-                     f"утих на {job['end']:.0f}-й.\n"
-                     f"Можно выбрать отрезок в пределах от {lo:.0f} до {hi:.0f} секунды, длиной от "
-                     f"{cfg['clip_min']} до {cfg['clip_max']} секунд. Предварительный выбор: {cur[0]:.0f}-{cur[1]:.0f}.\n\n")
-        user += f"СТРИМЕР ГОВОРИЛ:\n{said}\n\nЧАТ ПИСАЛ:\n{chat_txt or '(пусто)'}"
+            user += T["auto"].format(onset=job["onset"], peak=job["peak"], end=job["end"], lo=lo, hi=hi,
+                                     mn=cfg["clip_min"], mx=cfg["clip_max"], a=cur[0], b=cur[1])
+        user += T["body"].format(said=said, chat=chat_txt or T["empty"])
         try:
             from .learning import Learner
             liked, disliked = Learner().examples(job["channel"])
             if liked or disliked:
-                user += ("\n\nВКУС ВЛАДЕЛЬЦА (учитывай при оценке)."
-                         + ("\nПонравилось:\n- " + "\n- ".join(liked) if liked else "")
-                         + ("\nНе понравилось:\n- " + "\n- ".join(disliked) if disliked else ""))
+                user += (T["taste"]
+                         + (T["liked"] + "\n- ".join(liked) if liked else "")
+                         + (T["disliked"] + "\n- ".join(disliked) if disliked else ""))
         except Exception:
             pass
         pics = shots(job["raw"], cur[0], cur[1]) if cfg.get("ai_frames", True) and job.get("raw") else []
@@ -161,7 +237,7 @@ def ai_verdict(job: dict, transcript, lo: float, hi: float, cur: tuple[float, fl
         resp = client.messages.parse(
             model=cfg.get("ai_model") or "claude-haiku-5-5",
             max_tokens=8000,
-            system=SYSTEM,
+            system=system_prompt(str(job.get("lang") or ""), lang),
             messages=[{"role": "user", "content": ai_content(user, pics)}],
             output_config={"effort": "low"},
             output_format=Verdict,
@@ -193,10 +269,17 @@ def headline(job: dict, title: str, from_ai: bool, cfg: dict) -> str:
     return "" if job.get("kind") == "manual" else title.strip()
 
 
-def heuristic(job: dict, transcript) -> tuple[str, str]:
-    """Заголовок и цитата без ИИ."""
+_TITLES = {
+    "ru": {"laugh": "Чат разрывает от смеха", "hype": "Чат в шоке", "manual": "Клип вручную", "": "Момент"},
+    "en": {"laugh": "Chat can't stop laughing", "hype": "Chat is shocked", "manual": "Manual clip", "": "Moment"},
+}
+
+
+def heuristic(job: dict, transcript, lang: str = "ru") -> tuple[str, str]:
+    """Заголовок и цитата без ИИ. lang: язык заголовка."""
     kind = job.get("kind")
-    title = {"laugh": "Чат разрывает от смеха", "hype": "Чат в шоке", "manual": "Клип вручную"}.get(kind, "Момент")
+    names = _TITLES.get(lang, _TITLES["ru"])
+    title = names.get(kind or "", names[""])
     onset = job.get("onset", 0)
     near = [t for a, b, t in transcript if b >= onset - 12 and a <= onset + 3]
     quote = " ".join(near).strip()
@@ -205,7 +288,7 @@ def heuristic(job: dict, transcript) -> tuple[str, str]:
     return title, quote
 
 
-def caption(job: dict, title: str, desc: str, quote: str, score: int, dur: float, when: str) -> str:
+def caption(job: dict, title: str, desc: str, quote: str, score: int, dur: float, when: str, lang: str = "ru") -> str:
     lines = [f"🎬 {job['channel']} · {title}"]
     if desc:
         lines.append(desc)
@@ -217,8 +300,8 @@ def caption(job: dict, title: str, desc: str, quote: str, score: int, dur: float
     if job.get("kind") != "manual":
         meta.append(f"🔥 {score}/100")
         if job.get("peak_z"):
-            meta.append(f"чат ×{job['peak_z']:.0f}")
-    meta += [f"{dur:.0f} с", when]
+            meta.append(("chat" if lang == "en" else "чат") + f" ×{job['peak_z']:.0f}")
+    meta += [f"{dur:.0f} " + ("s" if lang == "en" else "с"), when]
     lines.append(" · ".join(meta))
     if job.get("title"):
         lines.append(f"📺 {job['title'][:100]}")

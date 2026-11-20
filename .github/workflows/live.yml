@@ -13,6 +13,9 @@ on:
       net_cap_kbps:
         description: Изобразить медленный интернет, кбит/с на стрим (пусто = без ограничения). Например 2500
         default: ""
+      lang:
+        description: Какие стримы брать, если каналы не заданы. ru, en или mix (три русских и три английских)
+        default: "ru"
   push:
     branches: [live-check]
 
@@ -56,6 +59,7 @@ jobs:
           PYTHONUTF8: "1"
           STREAMCLIPPER_DUMP: "1"
           STREAMCLIPPER_NET_CAP_KBPS: ${{ github.event.inputs.net_cap_kbps }}
+          SMOKE_LANG: ${{ github.event.inputs.lang }}
           SMOKE_OUT: smoke_clips
         run: |
           $sec = "${{ github.event.inputs.seconds }}"
